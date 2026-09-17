@@ -64,3 +64,25 @@ cargo test -p nexus-content  --test adversarial
   suites above are the committed safety net until a nightly run lands.
 - Triage rule: any libFuzzer crash → minimize, add the input to
   `crates/*/tests/adversarial.rs` + `fuzz/corpus/<target>/`, fix, re-run.
+## Nix runner (2026-09-17, wave2/nix)
+
+## Commands (from a checkout carrying `fuzz/`)
+
+```sh
+nix develop --command bash -c 'cargo fuzz list'
+nix develop --command bash -c 'cargo fuzz run parse_request -- -max_total_time=60'
+nix develop --command bash -c 'cargo fuzz run split_response -- -max_total_time=60'
+nix develop --command bash -c 'cargo fuzz run page_from_json -- -max_total_time=60'
+```
+
+Seed with the checked-in corpus: `cargo fuzz run <target> fuzz/corpus/<target>/`.
+Minimize new findings into `fuzz/corpus/<target>/` before committing.
+
+## CI (future, not this lane)
+
+Fuzz is **not** in CI yet (matches task-k-security hygiene row:
+"audit/fuzz not in CI"). Recommended increment: short nightly
+`cargo fuzz run <each target> -- -max_total_time=120` job, allowed to fail
+open (`continue-on-error: true`) until corpus + targets are stable, then
+enforce. Short smoke (`-runs=1000` per target) may join per-PR CI once
+deterministic.

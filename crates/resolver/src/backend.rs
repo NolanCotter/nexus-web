@@ -184,6 +184,11 @@ impl MemoryBackend {
     pub fn len(&self) -> usize {
         lock_ignoring_poison(&self.records).len()
     }
+
+    /// True when no records are stored.
+    pub fn is_empty(&self) -> bool {
+        lock_ignoring_poison(&self.records).is_empty()
+    }
 }
 
 impl Backend for MemoryBackend {
