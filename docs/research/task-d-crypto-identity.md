@@ -17,9 +17,7 @@ numbers and expiration, availability from the content layer. No CA, no PKI
 hierarchy, no global registry to trust. Everything needed to verify is either
 derivable from the public key or present in the signed record bundle itself.
 
-The v1 primitive is **Ed25519** (RFC 8032) via `ed25519-dalek` 2.x, with an
-algorithm tag in the identity encoding so the scheme can roll over later
-(e.g. to a post-quantum hybrid) without breaking the record format.
+The v1 primitive is **Ed25519** (RFC 8032) via `ed25519-dalek` 2.x, with an algorithm tag in the identity encoding so the scheme can roll over later (e.g. to a post-quantum hybrid) without breaking the record format.
 
 ---
 
@@ -46,8 +44,7 @@ crypto identity), transport.
 
 ## 3. Design principles
 
-1. **Self-certifying.** The identity string is derived from the public key by a
-   pure function. Verifying identity requires no external trust.
+1. **Self-certifying.** The identity string is derived from the public key by a pure function. Verifying identity requires no external trust.
 2. **Everything that matters is signed.** Every record carries its signer's key id, a sequence number, and optional validity window. No unsigned metadata.
 3. **Bounded lifetimes.** Nothing is valid forever. Records expire; the system degrades to "site unreachable" rather than "site trusted".
 4. **One key, one job.** Root key signs structure (rotation, delegation,
@@ -315,16 +312,10 @@ Minimality rules: `len` prefixes fixed-width (`u32 BE` — nothing to truncate);
 ### 8.5 Rotation (planned handoff)
 
 - Current root signs `RotateRecord { new_root, overlap window }`.
-- During `[not_before, not_after]` both keys are roots. After `not_after`
-  only `new_root` is.
-- Old-root content records (and their delegates' records) stay valid until
-  their own `not_after` → rotation is seamless, no content outage.
+- During `[not_before, not_after]` both keys are roots; after `not_after` only `new_root` is.
+- Old-root content records (and their delegates' records) stay valid until their own `not_after` → rotation is seamless, no content outage.
 - New content must come from the new root's chain.
-- Rotation is one step: A → B. A verifier walks `RotateRecord`s by seq;
-  a chain A→B→C is just two records. The verifier tracks one "current root
-  lineage"; any record signed by a key no longer in the lineage (post
-  `not_after`) is refused for **new** content but honored for **existing**
-  content within its own window (rule in §8.5/§9 step 6).
+- Rotation is one step: A → B. A verifier walks `RotateRecord`s by seq; a chain A→B→C is just two records. The verifier tracks one "current root lineage"; any record signed by a key no longer in the lineage (post `not_after`) is refused for **new** content but honored for **existing** content within its own window (rule in §8.5/§9 step 6).
 
 ### 8.6 Recovery (compromise / lost key)
 
@@ -412,8 +403,7 @@ loop {
 }
 ```
 
-The `ref` is self-describing: anyone fetching `ref` can verify the bytes
-hash to `ref` and every signature inside against the id.
+The `ref` is self-describing: anyone fetching it can verify the bytes hash to `ref` and every signature inside verifies against the id.
 
 ---
 
@@ -591,7 +581,7 @@ what the publisher signed. Prototype budget: ~3 days, single engineer.
    `now` when within skew? (Recommend yes, v2.)
 3. **Multi-delegate depth:** is delegate→delegate ever needed (large orgs,
    per-section editors)? v1 says no.
-4. **Recovery ceremony** UX: QR-encoded recovery key printout at genesis?
+4. **Recovery ceremony** UX: QR recovery-key printout at genesis?
    Hardware wallet support later?
 5. **Cross-layer hygiene:** content records pointing at CCN/IPFS/HTTP
    addresses — should the record carry a per-address signature/enc key hint
@@ -599,10 +589,10 @@ what the publisher signed. Prototype budget: ~3 days, single engineer.
 
 ## 18. References
 
-- RFC 8032 (Ed25519) — deterministic signatures 5.1.6, §3.4
-- ed25519-dalek 2.x docs (SigningKey/VerifyingKey/verify_strict)
+- RFC 8032 (Ed25519) — deterministic signatures
+- ed25519-dalek 2.x (SigningKey / VerifyingKey / verify_strict)
 - BIP-173 / BIP-350 (bech32 / bech32m)
-- Multi-hash convention (0x12 = sha2-256 prefix) — used for content hashes
-- IPFS/libp2p content-addressing patterns (hash-addressed blobs) — bundle model
-- DNSSEC design (delegation, signed records, TTLs) — conceptual ancestor,
+- Multi-hash convention (0x12 = sha2-256 prefix)
+- IPFS/libp2p content-addressing (hash-addressed blobs) — bundle model
+- DNSSEC (delegation, signed records, TTLs) — conceptual ancestor,
   adapted to zero-trust decentralized setting
