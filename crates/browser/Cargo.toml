@@ -24,3 +24,6 @@ thiserror = "1"
 
 [dev-dependencies]
 nexus-server = { path = "../server" }
+
+[lints]
+workspace = true

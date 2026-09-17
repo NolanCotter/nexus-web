@@ -11,3 +11,6 @@ path = "src/lib.rs"
 
 [dependencies]
 nexus-content = { path = "../content" }
+
+[lints]
+workspace = true
