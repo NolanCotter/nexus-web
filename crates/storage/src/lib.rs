@@ -16,36 +16,56 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+/// Store failures: I/O problems, missing blobs, oversize puts, and hash
+/// mismatches (corruption or wrong ID).
 #[derive(Debug, Error)]
 pub enum StoreError {
+    /// Filesystem operation failed (carries the OS message).
     #[error("io: {0}")]
     Io(String),
+    /// No blob for this content ID.
     #[error("not found: {0}")]
     NotFound(String),
+    /// Put exceeds [`MAX_BLOB`] (carries the attempted size).
     #[error("too large: {0} bytes")]
     TooLarge(usize),
+    /// Bytes do not match their claimed ID, or the ID is malformed.
     #[error("corrupt: {0}")]
     Corrupt(String),
     #[error("quota exceeded: {0}")]
     QuotaExceeded(String),
 }
 
+/// Max bytes accepted by a single put.
 pub const MAX_BLOB: usize = 4 * 1024 * 1024;
+
+/// BLAKE3 content ID (`b3:<hex>`) for raw bytes.
+/// Lock a mutex, recovering from poisoning instead of panicking.
+/// Poisoning means a previous holder panicked mid-mutation; the guarded
+/// maps are only ever mutated by single complete insert/remove calls, so
+/// the recovered state is always usable.
+fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub fn id_of(bytes: &[u8]) -> String {
     format!("b3:{}", hex::encode(blake3::hash(bytes).as_bytes()))
 }
 
+/// Volatile content-addressed map: bytes in, content ID out. Dedupes
+/// identical blobs; verification is hash recomputation.
 #[derive(Debug, Default)]
 pub struct MemStore {
     blobs: HashMap<String, Vec<u8>>,
 }
 
 impl MemStore {
+    /// Empty in-memory store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Store bytes, returning their content ID. Idempotent for duplicates.
     pub fn put(&mut self, bytes: &[u8]) -> Result<String, StoreError> {
         if bytes.len() > MAX_BLOB {
             return Err(StoreError::TooLarge(bytes.len()));
@@ -57,6 +77,7 @@ impl MemStore {
         Ok(id)
     }
 
+    /// Fetch blob bytes by content ID.
     pub fn get(&self, id: &str) -> Result<&[u8], StoreError> {
         self.blobs
             .get(id)
@@ -76,10 +97,12 @@ impl MemStore {
         }
     }
 
+    /// Number of distinct blobs held.
     pub fn len(&self) -> usize {
         self.blobs.len()
     }
 
+    /// True when no blobs are held.
     pub fn is_empty(&self) -> bool {
         self.blobs.is_empty()
     }
@@ -100,6 +123,7 @@ pub struct FsStore {
 }
 
 impl FsStore {
+    /// Open (not create) a CAS directory; files materialize on [`FsStore::put`].
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             inner: std::sync::Arc::new(FsInner {
@@ -115,7 +139,7 @@ impl FsStore {
     /// Quota is enforced by evicting unpinned blobs oldest-first
     /// (mtime heuristic) before each write.
     pub fn with_quota(self, max_bytes: Option<u64>, max_blobs: Option<usize>) -> Self {
-        let pinned = self.inner.pinned.lock().unwrap().clone();
+        let pinned = lock_ignoring_poison(&self.inner.pinned).clone();
         Self {
             inner: std::sync::Arc::new(FsInner {
                 dir: self.inner.dir.clone(),
@@ -128,15 +152,15 @@ impl FsStore {
 
     /// Pin a blob ID so quota eviction never removes it.
     pub fn pin(&self, id: &str) {
-        self.inner.pinned.lock().unwrap().insert(id.to_string());
+        lock_ignoring_poison(&self.inner.pinned).insert(id.to_string());
     }
 
     pub fn unpin(&self, id: &str) {
-        self.inner.pinned.lock().unwrap().remove(id);
+        lock_ignoring_poison(&self.inner.pinned).remove(id);
     }
 
     pub fn is_pinned(&self, id: &str) -> bool {
-        self.inner.pinned.lock().unwrap().contains(id)
+        lock_ignoring_poison(&self.inner.pinned).contains(id)
     }
 
     fn path_for(&self, id: &str) -> Result<PathBuf, StoreError> {
@@ -284,7 +308,7 @@ impl FsStore {
         }
         // Oldest-first via mtime (id tiebreak for same-tick files).
         inv.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.0.cmp(&b.0)));
-        let pinned = self.inner.pinned.lock().unwrap();
+        let pinned = lock_ignoring_poison(&self.inner.pinned);
         for (id, path, size, _) in &inv {
             if fits(total, count) {
                 break;
@@ -312,6 +336,7 @@ impl FsStore {
         }
     }
 
+    /// Store bytes durably (atomic temp-file + rename). Idempotent.
     pub fn put(&self, bytes: &[u8]) -> Result<String, StoreError> {
         if bytes.len() > MAX_BLOB {
             return Err(StoreError::TooLarge(bytes.len()));
@@ -337,6 +362,7 @@ impl FsStore {
         Ok(id)
     }
 
+    /// Fetch blob bytes by content ID, verifying the hash on read.
     pub fn get(&self, id: &str) -> Result<Vec<u8>, StoreError> {
         let path = self.path_for(id)?;
         let bytes = std::fs::read(&path).map_err(|_| StoreError::NotFound(id.to_string()))?;
@@ -354,6 +380,7 @@ impl FsStore {
         Ok(self.inventory()?.iter().map(|(_, _, s, _)| s).sum())
     }
 
+    /// Backing directory root.
     pub fn dir(&self) -> &Path {
         &self.inner.dir
     }

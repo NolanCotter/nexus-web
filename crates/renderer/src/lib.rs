@@ -16,6 +16,7 @@ use nexus_content::{Capability, Component, LinkTarget, Page};
 /// Terminal line width. Simple greedy word wrap, no hyphenation.
 pub const WRAP_WIDTH: usize = 80;
 
+/// Render a page to human-readable terminal text (pure function).
 pub fn render_text(page: &Page) -> String {
     let mut out = String::new();
     let mut links: Vec<String> = Vec::new();

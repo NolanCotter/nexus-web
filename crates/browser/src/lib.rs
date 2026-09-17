@@ -6,27 +6,39 @@ use nexus_content::Page;
 use nexus_resolver::{LocalResolver, Resolver};
 use thiserror::Error;
 
+/// Browser failures: resolution, transport, protocol, bad content, or a
+/// non-200 server status (carries code + body for display).
 #[derive(Debug, Error)]
 pub enum BrowserError {
+    /// Petname resolution failed.
     #[error("resolve: {0}")]
     Resolve(#[from] nexus_resolver::ResolveError),
+    /// FETCH transport failure.
     #[error("transport: {0}")]
     Transport(#[from] nexus_transport::TransportError),
+    /// Request encoding failed (invalid site/path caught locally).
     #[error("protocol: {0}")]
     Protocol(#[from] nexus_protocol::ProtocolError),
+    /// Route had no endpoints, or the body failed page validation.
     #[error("content: {0}")]
     Content(String),
+    /// Server answered with a non-200 status.
     #[error("server returned {0}: {1}")]
     Status(u16, String),
 }
 
+/// One history entry: where we went plus the parsed page we saw.
 #[derive(Debug, Clone)]
 pub struct Visit {
+    /// Site that was visited.
     pub site: String,
+    /// Path that was visited.
     pub path: String,
+    /// Parsed page at visit time.
     pub page: Page,
 }
 
+/// Past/present/future navigation stack (no tabs in v0).
 #[derive(Debug, Default)]
 pub struct History {
     past: Vec<Visit>,
@@ -35,10 +47,12 @@ pub struct History {
 }
 
 impl History {
+    /// Empty history (no current page).
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Visit a page: current becomes past, future is dropped.
     pub fn push(&mut self, visit: Visit) {
         if let Some(cur) = self.present.take() {
             self.past.push(cur);
@@ -47,6 +61,7 @@ impl History {
         self.future.clear();
     }
 
+    /// Step back; `None` when already at the oldest visit (stays put).
     pub fn back(&mut self) -> Option<&Visit> {
         let cur = self.present.take()?;
         if let Some(prev) = self.past.pop() {
@@ -59,6 +74,7 @@ impl History {
         self.present.as_ref()
     }
 
+    /// Step forward; `None` when no forward history exists.
     pub fn forward(&mut self) -> Option<&Visit> {
         let next = self.future.pop()?;
         if let Some(cur) = self.present.take() {
@@ -68,6 +84,7 @@ impl History {
         self.present.as_ref()
     }
 
+    /// Currently displayed visit, if any.
     pub fn current(&self) -> Option<&Visit> {
         self.present.as_ref()
     }

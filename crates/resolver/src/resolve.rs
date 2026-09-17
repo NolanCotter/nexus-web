@@ -28,7 +28,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, MemoryBackend};
-use crate::{LocalResolver, ResolveError, Resolver, Route};
+use crate::{lock_ignoring_poison, LocalResolver, ResolveError, Resolver, Route};
 
 /// Transport family of an endpoint record. Unknown values are carried
 /// opaquely and refused by the router (forward compatibility).
@@ -287,12 +287,12 @@ impl<B: Backend> CachingResolver<B> {
 
     /// Trust anchor + direct (offline) record admission.
     pub fn trust(&mut self, name: &str, verify: VerifyingKey) {
-        self.store.lock().unwrap().trust(name, verify);
+        lock_ignoring_poison(&self.store).trust(name, verify);
     }
 
     /// Direct record admission (bypasses backends; offline publishing).
     pub fn admit_record(&mut self, name: &str, record: EndpointRecord) -> bool {
-        self.store.lock().unwrap().admit(name, record)
+        lock_ignoring_poison(&self.store).admit(name, record)
     }
 
     /// Backends in query order.
@@ -307,7 +307,7 @@ impl<B: Backend> Resolver for CachingResolver<B> {
             return Err(ResolveError::InvalidName(name.to_string()));
         }
         // 1. Fast path: warm table.
-        if let Ok(route) = self.table.lock().unwrap().resolve(name) {
+        if let Ok(route) = lock_ignoring_poison(&self.table).resolve(name) {
             return Ok(route);
         }
         // 2. Cold path: pull records from backends, verify, admit.
@@ -325,27 +325,25 @@ impl<B: Backend> Resolver for CachingResolver<B> {
                 else {
                     continue;
                 };
-                let mut store = self.store.lock().unwrap();
+                let mut store = lock_ignoring_poison(&self.store);
                 if store.admit(name, decoded) {
                     if let Some(route) = store.route(name) {
                         // Warm the table; also pins the verified route.
-                        let _ = self.table.lock().unwrap().insert(name, route.clone());
+                        let _ = lock_ignoring_poison(&self.table).insert(name, route.clone());
                         return Ok(route);
                     }
                 }
             }
         }
         // 3. Verified store may already hold a route (offline warm cache).
-        self.store
-            .lock()
-            .unwrap()
+        lock_ignoring_poison(&self.store)
             .route(name)
             .ok_or_else(|| ResolveError::UnknownSite(name.to_string()))
     }
 
     fn list_names(&self) -> Vec<String> {
-        let mut names = self.table.lock().unwrap().list_names();
-        for n in self.store.lock().unwrap().known_names() {
+        let mut names = lock_ignoring_poison(&self.table).list_names();
+        for n in lock_ignoring_poison(&self.store).known_names() {
             if !names.contains(&n) {
                 names.push(n);
             }

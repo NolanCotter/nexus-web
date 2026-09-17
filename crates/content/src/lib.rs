@@ -8,82 +8,145 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
+/// Page schema version accepted by [`Page::validate`].
 pub const PAGE_SCHEMA: u32 = 1;
+/// Max components in one page, including nested ones.
 pub const MAX_COMPONENTS: usize = 4096;
+/// Max bytes of a single text/heading component.
 pub const MAX_TEXT_BYTES: usize = 256 * 1024;
 
+/// Content failures: invalid page data vs. serialization problems.
 #[derive(Debug, Error)]
 pub enum ContentError {
+    /// Page or component failed validation (schema, size, shape, limits).
     #[error("validation: {0}")]
     Validation(String),
+    /// JSON encoding failed.
     #[error("serialization: {0}")]
     Serialization(String),
 }
 
+/// A structured page: typed metadata + components, never raw HTML.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Page {
+    /// Schema version, site/path identity, title, revision.
     pub metadata: Metadata,
+    /// Top-level components (non-empty, bounded by [`MAX_COMPONENTS`]).
     pub components: Vec<Component>,
+    /// Capabilities requested by embedded apps (default: none).
     #[serde(default)]
     pub capabilities: Vec<Capability>,
 }
 
+/// Page identity and bookkeeping header.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Metadata {
+    /// Must equal [`PAGE_SCHEMA`].
     pub schema: u32,
+    /// Owning site name.
     pub site: String,
+    /// Path within the site.
     pub path: String,
+    /// Human-readable title (1-256 bytes).
     pub title: String,
+    /// Monotonic revision for cache invalidation.
     pub revision: u64,
 }
 
+/// One renderable unit of a page.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Component {
+    /// Plain paragraph text.
     Text {
+        /// Body text, bounded by [`MAX_TEXT_BYTES`].
         text: String,
     },
+    /// Section heading (`level` 1-6).
     Heading {
+        /// Heading level, 1 (largest) to 6.
         level: u8,
+        /// Heading text, bounded by [`MAX_TEXT_BYTES`].
         text: String,
     },
+    /// Content-addressed image reference.
     Image {
+        /// `b3:<hex>` content ID (see [`is_content_id`]).
         content_id: String,
+        /// Accessible description.
         alt: String,
     },
+    /// Navigable link.
     Link {
+        /// Visible label (1-1024 bytes).
         label: String,
+        /// Where the link goes.
         target: LinkTarget,
     },
+    /// Nested group of components (depth bounded to 32).
     Collection {
+        /// Child components.
         items: Vec<Component>,
     },
+    /// Interactive app with capability-gated props.
     App {
+        /// App identifier (1-128 bytes).
         app_id: String,
+        /// Opaque props passed to the app backend.
         props: serde_json::Value,
     },
 }
 
+/// Where a [`Component::Link`] points.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LinkTarget {
-    Page { site: String, path: String },
-    External { hint: String },
-    Action { action_id: String },
+    /// Another Nexus page.
+    Page {
+        /// Destination site.
+        site: String,
+        /// Destination path.
+        path: String,
+    },
+    /// Outside Nexus (rendered as a hint, never auto-followed).
+    External {
+        /// Human-readable destination hint.
+        hint: String,
+    },
+    /// An app action invoked through the capability broker.
+    Action {
+        /// Action identifier.
+        action_id: String,
+    },
 }
 
+/// A capability an app component requests; granted/denied by the WebVM broker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Capability {
-    Storage { max_kb: u32 },
-    Network { hosts: Vec<String> },
+    /// Local storage quota request.
+    Storage {
+        /// Requested quota in KiB.
+        max_kb: u32,
+    },
+    /// Network access to listed hosts.
+    Network {
+        /// Allowed host allowlist.
+        hosts: Vec<String>,
+    },
+    /// Show notifications.
     Notify,
+    /// Play audio.
     Audio,
+    /// Access the camera.
     Camera,
+    /// Access the microphone.
     Microphone,
 }
 
 impl Page {
+    /// Check schema, title length, component count/depth/shape. Pure:
+    /// takes only `&self`, reports the first violation as [`ContentError`].
     pub fn validate(&self) -> Result<(), ContentError> {
         if self.metadata.schema != PAGE_SCHEMA {
             return Err(ContentError::Validation(format!(
@@ -156,10 +219,12 @@ impl Page {
         Ok(())
     }
 
+    /// Serialize to canonical JSON bytes (field order fixed by the struct).
     pub fn to_canonical_json(&self) -> Result<Vec<u8>, ContentError> {
         serde_json::to_vec(self).map_err(|e| ContentError::Serialization(e.to_string()))
     }
 
+    /// Parse and validate untrusted page bytes (size-capped, then [`Page::validate`]).
     pub fn from_json(bytes: &[u8]) -> Result<Self, ContentError> {
         if bytes.len() > nexus_protocol_limits::max_page_bytes() {
             return Err(ContentError::Validation("page too large".into()));
@@ -177,10 +242,12 @@ impl Page {
     }
 }
 
+/// BLAKE3 content ID (`b3:<hex>`) over raw bytes.
 pub fn content_id_of(bytes: &[u8]) -> String {
     format!("b3:{}", hex::encode(blake3::hash(bytes).as_bytes()))
 }
 
+/// True for well-formed content IDs: `b3:` plus 64 lowercase/uppercase hex chars.
 pub fn is_content_id(s: &str) -> bool {
     let hex_part = s.strip_prefix("b3:").unwrap_or("__invalid__");
     hex_part.len() == 64 && hex_part.chars().all(|c| c.is_ascii_hexdigit())
@@ -417,6 +484,7 @@ fn references_of(page: &Page) -> Vec<Reference> {
 }
 
 mod nexus_protocol_limits {
+    /// Max accepted page bytes (kept in sync with the wire body limit).
     pub fn max_page_bytes() -> usize {
         1024 * 1024
     }

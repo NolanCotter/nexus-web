@@ -8,3 +8,6 @@ description = "NXP wire protocol: request/response types, parser, serializer"
 [lib]
 name = "nexus_protocol"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

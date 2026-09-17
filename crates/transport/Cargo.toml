@@ -12,3 +12,6 @@ path = "src/lib.rs"
 [dependencies]
 nexus-protocol = { path = "../protocol" }
 thiserror = "1"
+
+[lints]
+workspace = true

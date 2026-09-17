@@ -16,33 +16,44 @@ use std::time::Duration;
 use nexus_protocol as nxp;
 use thiserror::Error;
 
+/// Server failures: transport/protocol/I/O plus content problems
+/// (unreadable site dir, invalid page JSON, metadata mismatch).
 #[derive(Debug, Error)]
 pub enum ServerError {
+    /// Framing or socket failure on a connection.
     #[error("transport: {0}")]
     Transport(#[from] nexus_transport::TransportError),
+    /// Request line or response encoding failure.
     #[error("protocol: {0}")]
     Protocol(#[from] nxp::ProtocolError),
+    /// Filesystem or socket I/O failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// Site directory or page payload failed validation.
     #[error("content: {0}")]
     Content(String),
 }
 
+/// In-memory map of (site, path) to canonical page bytes served over NXP.
 #[derive(Debug, Default, Clone)]
 pub struct SiteStore {
     pages: HashMap<(String, String), Vec<u8>>,
 }
 
 impl SiteStore {
+    /// Empty store; populate with [`SiteStore::insert`] or [`SiteStore::load_dir`].
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Insert one page's canonical JSON bytes (no validation; use `load_dir`
+    /// for the validating path).
     pub fn insert(&mut self, site: &str, path: &str, page_json: Vec<u8>) {
         self.pages
             .insert((site.to_string(), path.to_string()), page_json);
     }
 
+    /// Look up a page's bytes by (site, path).
     pub fn get(&self, site: &str, path: &str) -> Option<&[u8]> {
         self.pages
             .get(&(site.to_string(), path.to_string()))
@@ -79,6 +90,7 @@ impl SiteStore {
         Ok(count)
     }
 
+    /// Sorted list of served (site, path) pairs, for startup logging.
     pub fn routes(&self) -> Vec<(String, String)> {
         let mut v: Vec<_> = self.pages.keys().cloned().collect();
         v.sort();
