@@ -34,7 +34,8 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #30 clippy `-D warnings` green under pinned toolchain (8 findings fixed)
 - [x] #31 offline-first browser cache with stale fallback (Milestone G)
 - [x] #32 resolver M3: seq, revocation tombstones, pin enforcement, rotation (ADR 009)
-- Next: security-test battery, records endpoint on server (M3 gap 1), TUI browser, DHT past gates.
+- [x] #33 security batteries: 237-input parser totality, traversal, 64-byte sig flips, resolver/store behavior (168 green)
+- Next: records endpoint on server (M3 gap 1), TUI browser, DHT past gates.
 
 ## Notes (wave 2, 2026-09-17)
 - `cargo test --workspace`: 141+ passed, 0 failed. `cargo fmt --check`: clean.
