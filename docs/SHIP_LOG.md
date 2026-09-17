@@ -19,6 +19,7 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #15 end-to-end integration test (server<->browser over TCP)
 - [x] #16 CI (fmt+clippy+test) + GitHub push
 - [x] #17 crypto identity research proposal archived (docs/research/)
+- [x] #18 unified `nexus` CLI (browse <site[/path]> + interactive back/forward/reload/history)
 - Next: wire signatures into fetch (M3), TUI browser, DHT experiment branch.
 
 ## Notes

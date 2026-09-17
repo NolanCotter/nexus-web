@@ -3,7 +3,7 @@
 //! Navigation history is a simple past/present/future stack (no tabs).
 
 use nexus_content::Page;
-use nexus_resolver::{LocalResolver, Resolver};
+use nexus_resolver::{LocalResolver, ResolveError, Resolver, Route};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -18,6 +18,8 @@ pub enum BrowserError {
     Content(String),
     #[error("server returned {0}: {1}")]
     Status(u16, String),
+    #[error("bad target '{0}': {1}")]
+    BadTarget(String, String),
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +72,153 @@ impl History {
 
     pub fn current(&self) -> Option<&Visit> {
         self.present.as_ref()
+    }
+
+    /// Total visits (past + present + future).
+    pub fn len(&self) -> usize {
+        self.past.len() + usize::from(self.present.is_some()) + self.future.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Index of the current visit within [`History::entries`].
+    pub fn position(&self) -> usize {
+        self.past.len()
+    }
+
+    /// Visits in chronological order, oldest first.
+    pub fn entries(&self) -> Vec<&Visit> {
+        let mut v: Vec<&Visit> = self.past.iter().collect();
+        if let Some(cur) = &self.present {
+            v.push(cur);
+        }
+        v.extend(self.future.iter().rev());
+        v
+    }
+
+    /// Swap the current page in place (reload) without clearing the future.
+    pub fn replace_current(&mut self, page: Page) {
+        if let Some(cur) = self.present.as_mut() {
+            cur.page = page;
+        }
+    }
+}
+
+/// Parse a navigation target: `site`, `site/path`, or `site/a/b`.
+/// A missing path defaults to `home` (example-site convention).
+pub fn parse_target(target: &str) -> Result<(String, String), BrowserError> {
+    let (site, path) = match target.split_once('/') {
+        Some((s, p)) => (s, p),
+        None => (target, "home"),
+    };
+    if site.is_empty() || path.is_empty() {
+        return Err(BrowserError::BadTarget(
+            target.to_string(),
+            "empty site or path".into(),
+        ));
+    }
+    if !nexus_protocol::is_valid_site(site) {
+        return Err(BrowserError::BadTarget(
+            site.to_string(),
+            "invalid site name".into(),
+        ));
+    }
+    if !nexus_protocol::is_valid_path(path) {
+        return Err(BrowserError::BadTarget(
+            path.to_string(),
+            "invalid path".into(),
+        ));
+    }
+    Ok((site.to_string(), path.to_string()))
+}
+
+/// Interactive browsing session: owns resolution + history and drives the
+/// same resolve->fetch path as [`navigate`], keeping state for back/forward.
+///
+/// Sites resolve lazily against the single `--server` endpoint; distributed
+/// resolution plugs in behind the same `Resolver` trait later.
+#[derive(Debug)]
+pub struct ClientSession {
+    resolver: LocalResolver,
+    server: String,
+    pub history: History,
+}
+
+impl ClientSession {
+    pub fn new(server: impl Into<String>) -> Self {
+        Self {
+            resolver: LocalResolver::new(),
+            server: server.into(),
+            history: History::new(),
+        }
+    }
+
+    fn route(&mut self, site: &str) -> Result<Route, BrowserError> {
+        if matches!(
+            self.resolver.resolve(site),
+            Err(ResolveError::UnknownSite(_))
+        ) {
+            self.resolver.insert(
+                site,
+                Route {
+                    endpoints: vec![self.server.clone()],
+                    pinned_site_id: None,
+                },
+            )?;
+        }
+        Ok(self.resolver.resolve(site)?)
+    }
+
+    fn fetch(&mut self, site: &str, path: &str) -> Result<Page, BrowserError> {
+        let route = self.route(site)?;
+        let endpoint = route
+            .endpoints
+            .first()
+            .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
+        fetch_page(endpoint, site, path)
+    }
+
+    /// Navigate to `<site[/path]>`, pushing a history entry.
+    pub fn open(&mut self, target: &str) -> Result<(), BrowserError> {
+        let (site, path) = parse_target(target)?;
+        let page = self.fetch(&site, &path)?;
+        self.history.push(Visit { site, path, page });
+        Ok(())
+    }
+
+    pub fn back(&mut self) -> Result<(), BrowserError> {
+        if self.history.back().is_none() {
+            return Err(BrowserError::Content("at the start of history".into()));
+        }
+        Ok(())
+    }
+
+    pub fn forward(&mut self) -> Result<(), BrowserError> {
+        if self.history.forward().is_none() {
+            return Err(BrowserError::Content("at the end of history".into()));
+        }
+        Ok(())
+    }
+
+    /// Refetch the current page and replace it in place (no new history entry).
+    pub fn reload(&mut self) -> Result<(), BrowserError> {
+        let (site, path) = self
+            .history
+            .current()
+            .map(|v| (v.site.clone(), v.path.clone()))
+            .ok_or_else(|| BrowserError::Content("nothing loaded yet".into()))?;
+        let page = self.fetch(&site, &path)?;
+        self.history.replace_current(page);
+        Ok(())
+    }
+
+    pub fn render_current(&self) -> String {
+        match self.history.current() {
+            Some(v) => nexus_renderer::render_text(&v.page),
+            None => String::new(),
+        }
     }
 }
 
@@ -183,5 +332,75 @@ mod tests {
         let addr = serve_once(test_page("example", "home"));
         let err = fetch_page(&addr.to_string(), "example", "missing").unwrap_err();
         assert!(matches!(err, BrowserError::Status(404, _)));
+    }
+
+    fn visit(path: &str, title: &str) -> Visit {
+        Visit {
+            site: "example".into(),
+            path: path.into(),
+            page: nexus_content::Page {
+                metadata: Metadata {
+                    schema: 1,
+                    site: "example".into(),
+                    path: path.into(),
+                    title: title.into(),
+                    revision: 1,
+                },
+                components: vec![Component::Text { text: "x".into() }],
+                capabilities: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn parse_target_defaults_to_home() {
+        assert_eq!(
+            parse_target("example").unwrap(),
+            ("example".into(), "home".into())
+        );
+        assert_eq!(
+            parse_target("example/about").unwrap(),
+            ("example".into(), "about".into())
+        );
+        assert_eq!(
+            parse_target("nolan/blog/hello").unwrap(),
+            ("nolan".into(), "blog/hello".into())
+        );
+    }
+
+    #[test]
+    fn parse_target_rejects_bad_input() {
+        for bad in ["", "example/", "/home", "EXAMPLE", "example/../x", "a b"] {
+            assert!(parse_target(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn history_position_len_entries() {
+        let mut h = History::new();
+        h.push(visit("a", "A"));
+        h.push(visit("b", "B"));
+        h.push(visit("c", "C"));
+        assert_eq!(h.len(), 3);
+        assert_eq!(h.position(), 2);
+        h.back();
+        assert_eq!(h.position(), 1);
+        let paths: Vec<&str> = h.entries().iter().map(|v| v.path.as_str()).collect();
+        assert_eq!(paths, vec!["a", "b", "c"]);
+        h.forward();
+        assert_eq!(h.position(), 2);
+    }
+
+    #[test]
+    fn reload_replaces_current_keeps_future() {
+        let mut h = History::new();
+        h.push(visit("a", "A"));
+        h.push(visit("b", "B"));
+        h.back(); // present = a, future = [b]
+        h.replace_current(visit("a", "A2").page);
+        assert_eq!(h.current().unwrap().page.metadata.title, "A2");
+        assert_eq!(h.len(), 2);
+        h.forward();
+        assert_eq!(h.current().unwrap().path, "b");
     }
 }
