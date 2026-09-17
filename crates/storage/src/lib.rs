@@ -9,6 +9,26 @@
 //!   evicting unpinned blobs oldest-first before each write.
 //! - eviction order uses file mtime as a heuristic for insertion age
 //!   (mtime can be altered externally; treat as best-effort, not security).
+//!
+//! # NXPACK1 replication packs
+//!
+//! `FsStore::export` packs blobs into a single file; `FsStore::import` loads
+//! one back. Both speak one format (all integers little-endian, no padding):
+//!
+//! ```text
+//! magic   7 bytes  "NXPACK1"
+//! count   u32      number of blobs
+//! per blob:
+//!   len   u32      payload length in bytes
+//!   id    32 bytes raw BLAKE3 content id (payload with the "b3:" prefix)
+//!   data  len bytes
+//! ```
+//!
+//! The embedded id is what makes verify-on-import sound: import re-hashes
+//! every payload and rejects the whole pack unless each id matches, before
+//! any byte is stored. Trailing data is rejected. Individual blobs are capped
+//! at [`MAX_BLOB`] and the whole pack at [`MAX_PACK`] (64 MiB). Input is
+//! attacker-controlled: the import path is total (parse errors, no panics).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -39,7 +59,6 @@ pub enum StoreError {
 /// Max bytes accepted by a single put.
 pub const MAX_BLOB: usize = 4 * 1024 * 1024;
 
-/// BLAKE3 content ID (`b3:<hex>`) for raw bytes.
 /// Lock a mutex, recovering from poisoning instead of panicking.
 /// Poisoning means a previous holder panicked mid-mutation; the guarded
 /// maps are only ever mutated by single complete insert/remove calls, so
@@ -48,6 +67,31 @@ fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_,
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// NXPACK1 magic bytes (7 bytes).
+pub const PACK_MAGIC: &[u8; 7] = b"NXPACK1";
+
+/// Raw content-id size used by packs (BLAKE3 output, no `b3:` prefix).
+pub const PACK_ID_LEN: usize = blake3::OUT_LEN;
+
+/// Total packed size cap: header + count + all ids + all payloads.
+pub const MAX_PACK: usize = 64 * 1024 * 1024;
+
+/// Fixed header size: magic + count.
+pub const PACK_HEADER_LEN: usize = PACK_MAGIC.len() + 4;
+
+/// Per-blob framing overhead: len + id.
+pub const PACK_ENTRY_OVERHEAD: usize = 4 + PACK_ID_LEN;
+
+/// Result of an `import`: how much of the pack was consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportReport {
+    /// Number of blobs stored (or already present).
+    pub blobs: usize,
+    /// Sum of payload bytes stored.
+    pub total_bytes: usize,
+}
+
+/// BLAKE3 content ID (`b3:<hex>`) for raw bytes.
 pub fn id_of(bytes: &[u8]) -> String {
     format!("b3:{}", hex::encode(blake3::hash(bytes).as_bytes()))
 }
@@ -384,6 +428,121 @@ impl FsStore {
     pub fn dir(&self) -> &Path {
         &self.inner.dir
     }
+
+    /// Pack the given content ids into one NXPACK1 file (see module docs).
+    ///
+    /// Every id must exist, or the export errors. Total pack size (header +
+    /// ids + payloads) is capped at [`MAX_PACK`]; individual blobs keep the
+    /// [`MAX_BLOB`] cap. Blobs are re-hashed on the way out, so a tampered
+    /// file on disk fails export (verify-on-read).
+    pub fn export(&self, ids: &[String]) -> Result<Vec<u8>, StoreError> {
+        let count = u32::try_from(ids.len()).map_err(|_| StoreError::TooLarge(ids.len()))?;
+        let mut out = Vec::with_capacity(
+            PACK_HEADER_LEN
+                .saturating_add(ids.len().saturating_mul(PACK_ENTRY_OVERHEAD))
+                .min(MAX_PACK),
+        );
+        out.extend_from_slice(PACK_MAGIC);
+        out.extend_from_slice(&count.to_le_bytes());
+        let mut total = PACK_HEADER_LEN;
+        for id in ids {
+            let bytes = self.get(id)?;
+            let len = bytes.len();
+            if len > MAX_BLOB {
+                return Err(StoreError::TooLarge(len));
+            }
+            total += PACK_ENTRY_OVERHEAD + len;
+            if total > MAX_PACK {
+                return Err(StoreError::TooLarge(total));
+            }
+            out.extend_from_slice(&(len as u32).to_le_bytes());
+            out.extend_from_slice(blake3::hash(&bytes).as_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        Ok(out)
+    }
+
+    /// Load an NXPACK1 file, storing every blob it carries (see module docs).
+    ///
+    /// The whole pack is parsed and every payload is re-hashed against its
+    /// embedded id before anything is written: a single flipped byte, a
+    /// truncated file, an overlarge blob, or trailing garbage all reject the
+    /// entire pack and leave the store untouched. Bytes are never `unwrap`ed.
+    pub fn import(&self, pack: &[u8]) -> Result<ImportReport, StoreError> {
+        if pack.len() > MAX_PACK {
+            return Err(StoreError::TooLarge(pack.len()));
+        }
+        let mut pos = 0usize;
+        if pack.len() < PACK_MAGIC.len() || &pack[..PACK_MAGIC.len()] != PACK_MAGIC {
+            return Err(StoreError::Corrupt("bad magic".into()));
+        }
+        pos += PACK_MAGIC.len();
+        let count = read_pack_u32(pack, &mut pos)?;
+        // count is attacker-controlled: cap the pre-allocation, never the loop.
+        let mut blobs: Vec<(String, Vec<u8>)> = Vec::with_capacity(count.min(1024) as usize);
+        let mut total_bytes = 0usize;
+        for _ in 0..count {
+            let len = read_pack_u32(pack, &mut pos)? as usize;
+            if len > MAX_BLOB {
+                return Err(StoreError::TooLarge(len));
+            }
+            let raw_id = read_pack_bytes(pack, &mut pos, PACK_ID_LEN)?;
+            let payload = read_pack_bytes(pack, &mut pos, len)?;
+            let digest = blake3::hash(payload);
+            let actual = digest.as_bytes();
+            if raw_id != actual {
+                return Err(StoreError::Corrupt(format!(
+                    "hash mismatch: expected {}, computed {}",
+                    hex::encode(raw_id),
+                    hex::encode(actual)
+                )));
+            }
+            total_bytes = total_bytes
+                .checked_add(len)
+                .ok_or_else(|| StoreError::Corrupt("total overflow".into()))?;
+            blobs.push((format!("b3:{}", hex::encode(raw_id)), payload.to_vec()));
+        }
+        if pos != pack.len() {
+            return Err(StoreError::Corrupt(format!(
+                "{} trailing bytes",
+                pack.len() - pos
+            )));
+        }
+        // Verification completed above; only now touch the store.
+        for (_, bytes) in &blobs {
+            self.put(bytes)?; // idempotent; content hashes to the verified id
+        }
+        Ok(ImportReport {
+            blobs: blobs.len(),
+            total_bytes,
+        })
+    }
+}
+
+/// Read 4 little-endian bytes as `u32` from a pack, bounds-checked.
+fn read_pack_u32(pack: &[u8], pos: &mut usize) -> Result<u32, StoreError> {
+    let bytes = read_pack_bytes(pack, pos, 4)?;
+    let fixed: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| StoreError::Corrupt("bad length field".into()))?;
+    Ok(u32::from_le_bytes(fixed))
+}
+
+/// Bounds-checked slice read that advances `pos`.
+fn read_pack_bytes<'a>(
+    pack: &'a [u8],
+    pos: &mut usize,
+    len: usize,
+) -> Result<&'a [u8], StoreError> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| StoreError::Corrupt("length overflow".into()))?;
+    if end > pack.len() {
+        return Err(StoreError::Corrupt("truncated pack".into()));
+    }
+    let out = &pack[*pos..end];
+    *pos = end;
+    Ok(out)
 }
 
 #[cfg(test)]
