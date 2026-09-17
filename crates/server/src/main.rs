@@ -1,16 +1,17 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 
-use nexus_server::SiteStore;
+use nexus_server::{ServerConfig, SiteStore};
 
 fn usage() -> &'static str {
-    "usage: nexus-server [--port PORT] [--site NAME] [--dir PATH]"
+    "usage: nexus-server [--port PORT] [--site NAME] [--dir PATH] [--max-connections N]"
 }
 
 fn main() {
     let mut port: u16 = 7843;
     let mut site = "example".to_string();
     let mut dir = PathBuf::from("sites/example");
+    let mut config = ServerConfig::default();
 
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
@@ -32,6 +33,16 @@ fn main() {
                     eprintln!("{}", usage());
                     std::process::exit(2);
                 }))
+            }
+            "--max-connections" => {
+                config.max_connections = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or_else(|| {
+                        eprintln!("{}", usage());
+                        std::process::exit(2);
+                    })
             }
             "--help" | "-h" => {
                 println!("{}", usage());
@@ -64,7 +75,7 @@ fn main() {
         std::process::exit(1);
     });
     eprintln!("nexus-server listening on 127.0.0.1:{port} (NXP/0.1)");
-    if let Err(e) = nexus_server::serve(listener, store) {
+    if let Err(e) = nexus_server::serve_with_config(listener, store, config) {
         eprintln!("server error: {e}");
         std::process::exit(1);
     }

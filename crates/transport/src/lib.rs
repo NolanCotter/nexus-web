@@ -22,7 +22,20 @@ pub enum TransportError {
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Map an EOF mid-frame to `Truncated`; all other I/O errors pass through.
+/// Timeouts surface as `WouldBlock`/`TimedOut` and stay `Io` so callers can
+/// distinguish a slow peer from a peer that went away mid-frame.
+fn map_frame_eof(e: std::io::Error) -> TransportError {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        TransportError::Protocol(nxp::ProtocolError::Truncated)
+    } else {
+        TransportError::Io(e)
+    }
+}
+
 /// Read a single `\n`-terminated line, enforcing MAX_LINE.
+///
+/// EOF before `\n` returns `Truncated` (partial frame), not a bare I/O error.
 pub fn read_line_limited<R: BufRead>(r: &mut R) -> Result<String, TransportError> {
     let mut buf = Vec::with_capacity(256);
     let mut total = 0usize;
@@ -39,7 +52,7 @@ pub fn read_line_limited<R: BufRead>(r: &mut R) -> Result<String, TransportError
                     break;
                 }
             }
-            Err(e) => return Err(TransportError::Io(e)),
+            Err(e) => return Err(map_frame_eof(e)),
         }
     }
     String::from_utf8(buf).map_err(|_| {
@@ -48,12 +61,16 @@ pub fn read_line_limited<R: BufRead>(r: &mut R) -> Result<String, TransportError
 }
 
 /// Read exactly `len` body bytes, enforcing MAX_BODY.
+///
+/// The size check runs before allocation, so an oversized length claim
+/// errors without allocating or touching the reader. EOF mid-body returns
+/// `Truncated`.
 pub fn read_body<R: Read>(r: &mut R, len: usize) -> Result<Vec<u8>, TransportError> {
     if len > nxp::MAX_BODY {
         return Err(nxp::ProtocolError::BodyTooLarge(len).into());
     }
     let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
+    r.read_exact(&mut buf).map_err(map_frame_eof)?;
     Ok(buf)
 }
 
@@ -98,5 +115,41 @@ mod tests {
     fn body_rejects_huge_claim() {
         let mut c = Cursor::new(vec![0u8; 8]);
         assert!(read_body(&mut c, nxp::MAX_BODY + 1).is_err());
+    }
+
+    #[test]
+    fn oversized_claim_never_reads() {
+        // Errors before allocating or touching the reader.
+        struct Exploding;
+        impl Read for Exploding {
+            fn read(&mut self, _b: &mut [u8]) -> std::io::Result<usize> {
+                panic!("must not read on oversized claim")
+            }
+        }
+        let err = read_body(&mut Exploding, nxp::MAX_BODY + 1).unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::Protocol(nxp::ProtocolError::BodyTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn body_eof_midway_is_truncated() {
+        let mut c = Cursor::new(vec![0u8; 8]);
+        let err = read_body(&mut c, 100).unwrap_err();
+        assert!(
+            matches!(err, TransportError::Protocol(nxp::ProtocolError::Truncated)),
+            "expected Truncated, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn line_eof_midway_is_truncated() {
+        let mut c = BufReader::new(Cursor::new(b"NXP/0.1 FETCH partial"));
+        let err = read_line_limited(&mut c).unwrap_err();
+        assert!(
+            matches!(err, TransportError::Protocol(nxp::ProtocolError::Truncated)),
+            "expected Truncated, got {err:?}"
+        );
     }
 }
