@@ -1,0 +1,9 @@
+/target
+/dist
+/result
+.direnv/
+.envrc.local
+**/*.rs.bk
+*.orig
+*.rej
+sites/*/cache/
