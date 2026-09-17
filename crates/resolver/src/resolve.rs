@@ -679,8 +679,8 @@ impl<B: Backend> Resolver for CachingResolver<B> {
 mod tests {
     use super::*;
     use crate::backend::MemoryBackend;
-    use nexus_identity::SiteIdentity;
     use crate::LocalResolver;
+    use nexus_identity::SiteIdentity;
 
     /// Deterministic test key (fixed secret, no RNG needed).
     fn test_key(seed: u8) -> SigningKey {
