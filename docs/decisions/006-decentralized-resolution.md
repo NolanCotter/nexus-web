@@ -1,218 +1,165 @@
 # 006 — Decentralized Resolution (name → identity → records → nodes)
 
-- Status: proposed
+- Status: **proposed — extension layer. Companion to ADR 004 (accepted: local-first resolver behind a trait).**
 - Owner: resolution lane
-- Scope: `crates/resolver`, and the on-wire contract consumed by `crates/identity` and `crates/protocol`
+- Scope: `crates/resolver` (`Resolver` trait, `Backend` seam, `CachingResolver`), riding on `crates/identity` signed records (`ResourceRecord`/`SiteIdentity`).
 
 ## 1. Problem
 
-A user types `alice.nex`. The system must answer: *who owns that name,
-what does their identity vouch for, and how do I reach the machines behind
-it?* That is a chain of three lookups with different trust semantics:
+A user types `alice`. The system must answer: *who owns that name, what
+does their identity vouch for, and how do I reach the machines behind it?*
+A chain of three lookups with different trust semantics:
 
 ```
-name  ──(registration)──▶  identity        "alice.nex" → public key (anchor of trust)
-identity ──(publication)─▶  records         public key → signed records (what it vouches for)
-records ──(rendezvous)──▶  nodes           records → transport addresses (how to connect)
+name  ──(trust anchor)──▶  identity        "alice" → site key (out-of-band, known_hosts-style)
+identity ──(publication)─▶  records         site key → signed records (what it vouches for)
+records ──(rendezvous)──▶  nodes           records → transport addresses (Route endpoints)
 ```
 
-Each hop has its own failure mode. Name→identity needs a registry with
-anti-squatting policy. Identity→records needs authenticity (signatures),
-freshness (sequence numbers), and expiry. Records→nodes needs a transport
-model that survives NAT, churn, and censorship (tcp/quic, tor, i2p, relay).
-
-The trap: it is very easy to spend months building a global DHT before the
-first two hops even have a correct data model. This document is the
-recommendation to **not do that**.
+Each hop fails differently. Name→identity needs registration/anti-squatting
+policy (a separate task lane). Identity→records needs authenticity
+(Ed25519), freshness, expiry. Records→nodes needs a transport model. The
+trap: building a global DHT before hops 1–2 have a correct local model.
+This document is the recommendation to **not do that** — ADR 004 already
+decided it; here is the distributed layer it defers.
 
 ## 2. Candidate approaches
 
-| Approach | What it gives you | Cost | Verdict |
+| Approach | Gives you | Costs | Verdict |
 |---|---|---|---|
-| Kademlia DHT | global name→record lookup, replication, churn tolerance | routing tables, bootstrap, sybil/eclipse defense, mutable-record rules | **v3, after the data model is proven** |
-| Gossip / epidemic | offline-first replication, eventual consistency | unbounded state, weak point-lookup, sync latency | **v2, ambient sync among trusted peers** |
-| Signed records | authenticity of every hop, cache-safe, forgery-proof mirrors | needs key lifecycle (rotation, revocation) | **v0, the base layer — not optional** |
-| Peer discovery | solves the bootstrap chicken-and-egg | bootstrap nodes are trust points | **v0 component, not a resolver** |
-| Federated resolvers | fast, cacheable, familiar DNS-ish semantics | operator can censor (cannot forge) | **v1, the only networked backend** |
-| Hybrid | incremental capability, no rewrite | multiple moving parts, defined precedence | **this is the plan** |
+| Kademlia DHT | global lookup, replication, churn tolerance | routing, bootstrap, sybil/eclipse defense, mutable-record rules | **v3, gated** |
+| Gossip / epidemic | offline-first replication, eventual consistency | unbounded state, weak point-lookup, sync latency | **v2, ambient sync** |
+| Signed records (Ed25519) | authenticity of every hop, forge-proof caches | key lifecycle (rotation, delegation) | **v0 base layer — done** (`crates/identity`) |
+| Peer discovery | bootstrap chicken-and-egg fix | bootstrap nodes are trust points | **v0 component** (transport lane) |
+| Federated resolvers | fast, cacheable, DNS-like pull | operator can withhold (cannot forge) | **v1, first networked backend** |
+| Hybrid | incremental capability, no rewrite | precedence must be documented | **this is the plan** |
 
-The cryptographic core is *signed records*, and it is not really an option:
-every other approach becomes safe the moment values are
-signed-by-identity and cheap to verify. The decision below layers the rest
-on top of it.
+Signed records are not an option — they are the prerequisite. Everything
+else became safe the moment records verify against the site key before
+they are trusted or stored.
 
 ### Why not the DHT first
 
-1. **The hard part is mutation semantics, not routing.** How do updates,
-   revocations, and key rotation interact? Which record wins? What does a
-   cache do with a stale-but-valid record? None of that is answered by
-   XOR-distance routing, and all of it must be nailed down *before* the
-   DHT value format is frozen (DHT values are amortized/replicated and
-   painful to migrate).
-2. **DHTs are a multi-month tax.** Kademlia done properly (bucket refresh,
-   iterative lookups, replication, bootstrap discipline, eclipse defense)
-   is the largest subsystem in this project. Spending it before the
-   local resolver exists means the DHT encodes guesses.
-3. **Bootstrap is unsolved anyway.** A DHT still needs seed peers, which
-   means you need the federated/peer-discovery layer regardless.
-4. **Testability.** Routing tables and network timeouts are terrible to
-   unit test. Signed-record semantics are pure logic and test perfectly.
-   Land the pure logic first, and the DHT becomes *one more backend* with a
-   conformance test instead of the whole world.
+1. **The hard part is mutation semantics, not routing.** Updates,
+   revocations, key rotation, cache staleness — none of it is answered by
+   XOR-distance routing, and all of it must be fixed before the DHT value
+   format is frozen (values are replicated and painful to migrate).
+2. **A DHT is a multi-month tax.** Kademlia done properly (bucket refresh,
+   iterative lookup, replication, bootstrap discipline, eclipse defense)
+   is the largest subsystem in this project. Building it before the local
+   model exists means the DHT encodes guesses.
+3. **Bootstrap is unsolved anyway.** A DHT still needs seed peers — the
+   federated/peer-discovery layer is needed regardless.
+4. **Testability.** Routing tables are hard to unit test; signed-record
+   semantics are pure logic. Land the pure logic, and the DHT becomes *one
+   more backend* behind a conformance test — not the whole world.
 
-## 3. Resolution in one paragraph
+## 3. What v0 actually is (shipped, per SHIP_LOG #5/#6)
 
-Every identity owns a monotonically-versioned set of signed records under a
-zone key. A resolver is a *read-mostly cache*: it validates everything it
-receives (signature, sequence, expiry, revocation ledger), stores what is
-valid, and answers from the best record it has seen — offline if necessary.
-Backends (local store, federated resolver, later gossip, later DHT) are
-pluggable *transport* for the same signed records; they never change the
-trust model, because records authenticate themselves.
+- `crates/identity`: Ed25519 `SiteIdentity`, signed `ResourceRecord`
+  (site → path → content hash, with expiry), strict `verify_strict`
+  verification, `Delegation` + `RotationLog` types.
+- `crates/resolver`: `Resolver` trait (`resolve(name) -> Route`,
+  `list_names`), `LocalResolver` petname table, name validation.
+- `Route { endpoints: Vec<String>, pinned_site_id: Option<String> }`.
 
-## 4. Data model (v0 — gets this exactly right)
+Missing today, by design: **sequence numbers**. Records carry expiry but no
+version; the local core works because each name is single-source. The first
+multi-source upgrade — before ANY second backend — is `seq` per
+(site, kind) with "newest verified wins".
 
-```
-ZoneId      = blake3(name_bytes)                        // namespaced, opaque, registered
-IdentityId  = blake3(public_key_bytes)                  // the anchor of trust
-SignedRecord = { zone, seq, kind, payload, expires_at, signature }
-  signature covers: zone ‖ seq ‖ kind ‖ payload ‖ expires_at
-  seq is strictly monotonic per (zone, kind); newer wins
-RecordKind: Node | Service | Content | Alias | Delegation | Revocation
-NodeAddr = { transport: Tcp|Quic|Tor|I2p|Relay, multiaddr: bytes, roles: [Resolver|Relay|Storage|Gateway] }
-Revocation  = { seq, invalidates_up_to }                // tombstone, kept forever (short)
-Delegation  = { seq, delegate_key, scope }              // key rotation / sub-key publish
-```
+## 4. Extension layer (this task, `crates/resolver`)
 
-Rules that are testable before any network exists:
+The chain is completed without touching `crates/identity`:
 
-- Signature must verify for the record to enter the store (v1: mock provider).
-- For each `(zone, kind)` only the highest `seq` is *live*; lower seqs are
-  kept for audit but never served.
-- Expired records are not served; negative cache entries expire too, so a
-  name can come back into existence.
-- A revocation invalidates all records of that zone with `seq ≤ N`,
-  including the revocation's own predecessor set — revocations cannot be
-  un-revoked except by a *higher* revocation, not by a resurrected record.
-- Delegations expand the set of keys accepted for a zone; revocation of the
-  delegator kills the delegation.
+- `EndpointRecord` (`resolve.rs`): signed *node/address* record —
+  `site ‖ transport ‖ host ‖ port ‖ expires`, canonical bytes + strict
+  Ed25519, mirroring `ResourceRecord`'s shape. This is the **records →
+  nodes** hop: site key to routable endpoint.
+- `RecordStore` (`resolve.rs`): verified local-first cache. Admission =
+  full verification against the name's trust anchor (out-of-band, like a
+  DNSSEC root). A poisoned backend can deliver garbage; verification
+  discards it for free. Injected clock for deterministic expiry tests.
+- `CachingResolver<B>` (`resolve.rs`): implements the `Resolver` trait.
+  Fast path = warm petname table; cold path = pull signed records from
+  backends, verify, admit, warm the table. Works with zero backends.
+- `Backend` trait (`backend.rs`): the seam. `fetch(name) -> Vec<SignedRecord>`,
+  `advertise(record)`. Backends never validate, merge, or decide policy.
+- Stubs: `FederatedBackend` (v1), `GossipBackend` (v2), `DhtBackend` (v3),
+  `MemoryBackend` (in-memory conformance double — a real backend passing
+  the same scenarios as `MemoryBackend` is a correct backend).
 
-## 5. Local-first resolver trait + DHT extension point (Rust)
+### The frozen DHT wire contract (v3, decided now so the graft is mechanical)
 
-`crates/resolver` ships:
+- **Key**: `blake3(name ‖ 0x00 ‖ record_kind)` — one key per
+  (name, kind), so a lookup fetches exactly one record family.
+- **Value**: signed-record envelope list, cap 16 per key; merge = the core's
+  rule (newest verified wins). Replicas never "repair" toward a lower version.
+- **Accept**: record verified against the site key *before* storing;
+  replication within the key's k-bucket; refresh on expiry; re-publish on
+  version change.
+- **Bootstrap**: federated node records + cached peers + optional static
+  file. Never a hard dependency of resolution.
+- **Gate**: DHT ships only when (a) v0 model tests green, (b) federated
+  backend dogfooded, (c) a second independent implementation interoperates
+  on this envelope format. If it never clears the gate, shipping without a
+  DHT is a valid outcome.
 
-```rust
-pub trait Resolver {                                          // the app-facing API
-    fn resolve(&self, name: &str) -> Result<Resolution, ResolveError>;
-    fn publish(&mut self, record: SignedRecord) -> Result<(), PublishError>;
-    fn validate(&self, record: &SignedRecord) -> Result<ValidatedRecord, ValidationError>;
-}
+## 5. Advantages
 
-#[async_trait]
-pub trait Backend: Send + Sync {                              // the extension point
-    async fn lookup(&self, q: &Query) -> Vec<SignedRecord>;   // best-effort pull
-    async fn advertise(&self, r: &ValidatedRecord) -> Result<(), BackendError>;
-    async fn subscribe(&self, q: &Query) -> mpsc::Receiver<SignedRecord>; // default: no-op
-}
-```
-
-`LocalStore` is a `Backend` (disk-backed). `FederatedBackend` is the only
-networked backend in v1. `GossipBackend` is v2. `DhtBackend` is v3 and is
-declared now as a typed stub with its wire contract frozen in this doc:
-
-### DHT wire contract (frozen at v0 so the v3 graft is mechanical)
-
-- **Key**: `blake3(zone_id ‖ 0x00 ‖ record_kind_discriminant)` — one key
-  per (zone, kind), so a resolver fetches exactly the record family it needs.
-- **Value**: a signed-record envelope (cap 16 records per key, newest seq
-  wins on merge — the resolver's merge rule is the DHT's merge rule).
-- **Acceptance**: signature verified before storing; higher `seq` replaces.
-  Replicas never "repair" a record with a lower seq.
-- **Replication**: nodes within `k` of the key hold replicas; refresh on
-  record expiry; re-publish on seq change.
-- **Bootstrap**: seed list from `FederatedBackend` node records + cached
-  peers + optional static file. Never a hard dependency.
-- **Milestone gate**: DHT ships only after (a) the v0 model tests pass,
-  (b) the federated backend is dogfooded in the field, (c) a second
-  independent implementation interoperates on this exact envelope format.
-
-The `LayeredResolver` wires `[LocalStore, FederatedBackend, …]` with a
-policy: query all backends, validate everything, merge by (seq, expiry,
-revocation), return the best resolution bounded by a freshness window —
-never wait longer than `resolve_timeout` on a cache hit.
-
-## 6. Advantages of this plan
-
-- The correctness-critical code is pure, offline, and unit-testable today.
+- Correctness-critical code is pure, offline, and unit-tested (14 tests,
+  real Ed25519, zero network).
 - Backends are swappable behind one trait; the DHT later is ~1 new file +
   conformance tests, not a rewrite of resolution.
-- Offline-first: a node with a warm cache resolves names with zero network.
-- Forged/stale data from any backend is discarded at the validation
-  boundary — poisoning a federated resolver or a DHT replica costs nothing.
-- Semantics are the same at every layer (same merge rule), so behavior is
+- Offline-first: warm cache + trust anchors resolve with no network.
+- Forged data from any backend dies at the validation boundary for free.
+- One merge rule everywhere (newest verified wins), so behavior is
   predictable as backends are added.
 
-## 7. Disadvantages
+## 6. Disadvantages
 
-- v1 depends on federated resolvers for *cold* global lookups — a
-  centralized availability point (authenticity is never centralized, but
-  availability is). Acceptable for the first mile; gossip/DHT remove it.
-- Three more backends = more moving parts; precedence and timeout policy
-  must be documented and tested, or behavior becomes "whatever finished
-  first."
-- Gossip can grow unbounded state unless GC policy (expiry-based pruning)
-  is enforced; this is a v2 problem with a known answer, not a research gap.
+- v1 depends on federated resolvers for *cold* global lookups —
+  centralized availability (never centralized authenticity).
+- Three backends = more moving parts; precedence and timeouts must be
+  documented (v0 backend seam is synchronous; async lands with real I/O).
+- Gossip needs expiry-based GC or state grows unbounded (v2 problem, known
+  answer).
 
-## 8. Risks
+## 7. Risks
 
-- **Data-model drift**: if name semantics (case sensitivity, Unicode, zone
-  scope, squatting rules) are not fixed at v0, the zone-key derivation and
-  DHT key contract must change later. Mitigation: names are normalized
-  (NFKC, lowercase, punycode) at the *registration* layer before they ever
-  touch `blake3`; resolver treats names as opaque bytes.
-- **Key lifecycle churn**: rotation/revocation must exist in the model now
-  or every published record becomes immortal lock-in. Mitigation: `Delegation`
-  + `Revocation` record kinds are part of v0 (minimal semantics, tested).
-- **DHT scope creep returning**: the trait boundary + frozen wire contract +
-  three milestone gates above are the tripwire. If the DHT is still not
-  warranted at v3, shipping without it is a valid outcome.
-- **Backend poisoning**: mitigated by validation-at-the-boundary (see §6) —
-  this is exactly why signed records are the base layer.
-- **Consistency confusion**: "which answer is right" when backends disagree
-  must be one deterministic rule (max seq, then expiry, then revocation),
-  not a race. The resolver owns the merge; backends never do.
+- **Missing seq**: single-source assumption breaks the moment two backends
+  disagree. Mitigation: seq is the FIRST multi-source upgrade, gated
+  before gossip/DHT.
+- **v0 endpoint convention is provisional**: records are carried under
+  path `@{name}` with the `EndpointRecord` JSON in `content_hash`
+  (`resolve.rs`). This is protocol-lane negotiable; the seam isolates it.
+- **Key lifecycle**: rotation/delegation types exist in `crates/identity`;
+  wiring them into `RecordStore` admission is a follow-up before v1.
+- **DHT scope creep**: the frozen contract + three gates are the tripwire;
+  shipping without the DHT is a valid outcome.
+- **Trust anchor bootstrapping** (name → key, out-of-band) is the real
+  decentralization bottleneck; it is exactly as hard as DNS trust anchors.
 
-## 9. Recommended prototype (one working week, sequential)
+## 8. Recommended prototype (next steps, mapped onto SHIP_LOG's M3/M4)
 
-1. **Day 1–2 — model + store (pure logic).** `SignedRecord`, validation,
-   `LocalStore` (append-only JSONL/hex log + per-zone kind index). Unit
-   tests: bad sig rejected; higher seq wins; expiry not served; revocation
-   tombstones; delegation expands accepted keys; negative cache. No network,
-   no crypto dependency (mock verifier behind `CryptoProvider`).
-2. **Day 3 — resolution + CLI.** `resolve("alice.nex")` and
-   `publish record.json` in a thin `nexus-resolve` binary. Fully offline.
-3. **Day 4 — federated backend.** Minimal `query(name) → envelopes` over
-   HTTP/QUIC (see `crates/protocol`), storing only validated records, with
-   a mock-server conformance test for the `Backend` trait.
-4. **Day 5 — reboot test.** Cold start offline: resolve from warm cache
-   with correct TTL/negative-cache behavior; record expiry observed.
-   Write the `Backend` conformance test suite (so DHT/gossip land behind a
-   green gate).
-5. **v2** gossip backend (ambient sync). **v3** DHT, gated on interop.
+1. ~~Model + store~~ — **done** (SHIP_LOG #5/#6; extension layer added by
+   this task, 14 tests green).
+2. **Next (M3): seq numbers + revocation.** Add `seq` to the record
+   envelope, per-site "newest verified wins", revocation as an explicit
+   tombstone record. Frees the model for multi-source.
+3. **Then: `FederatedBackend` for real** — `GET /resolve/{name}` → JSON
+   envelopes over the transport layer; `MemoryBackend` scenarios as the
+   conformance test. Dogfood in the field.
+4. **v2: `GossipBackend`** — state-summary exchange (bloom + high water),
+   expiry-based GC.
+5. **v3: `DhtBackend`**, only after the three gates. Wire contract frozen
+   above; mechanically grafted behind `Backend`.
 
-Concrete acceptance for v0: the resolver answers correctly from a local
-fixture for (valid update, replay, expired, revoked, delegated) — a
-sequence of ~40 property-test scenarios, no network involved.
+## 9. Files
 
-## 10. Files
-
-- `docs/decisions/006-decentralized-resolution.md` — this document
-- `crates/resolver/Cargo.toml` — std-only, `crypto-ed25519` feature seam
-- `crates/resolver/src/lib.rs` — crate docs, re-exports
-- `crates/resolver/src/model.rs` — types, envelope, wire helpers
-- `crates/resolver/src/crypto.rs` — `CryptoProvider` trait + mock + real seam
-- `crates/resolver/src/store.rs` — `LocalStore`, merge/conflict rules
-- `crates/resolver/src/backend.rs` — `Backend`/`Resolver` traits, layered
-  resolver, `DhtBackend`/`GossipBackend`/`FederatedBackend` stubs
-- `crates/resolver/src/resolve.rs` — the resolution pipeline
-- `crates/resolver/tests/resolve_smoke.rs` — offline behavior tests
+- `crates/resolver/src/lib.rs` — `Resolver` trait, `LocalResolver`, errors (extended)
+- `crates/resolver/src/backend.rs` — `Backend` trait, federated/gossip/DHT stubs, `MemoryBackend`
+- `crates/resolver/src/resolve.rs` — `EndpointRecord`, `RecordStore`, `CachingResolver`, 14 tests
+- `crates/identity/src/lib.rs` — unchanged base layer (`SiteIdentity`, `ResourceRecord`)
+- `docs/decisions/004-resolution.md` — accepted local-first decision
+- `docs/resolution.md` — v0 resolution model notes

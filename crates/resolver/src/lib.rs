@@ -3,9 +3,29 @@
 //! The local resolver maps human petnames (e.g. `example`) to a
 //! [`Route`] describing where to reach the site. Distributed resolution
 //! (DHT/gossip) is a future extension behind the [`Resolver`] trait.
+//!
+//! Extension layer (Task E):
+//! - [`backend`]  — the backend seam: federated (v1), gossip (v2), DHT (v3),
+//!   plus an in-memory conformance backend.
+//! - [`resolve`]  — signed-record resolution: `EndpointRecord` (records →
+//!   nodes), the verified `RecordStore`, and `CachingResolver` chaining the
+//!   warm petname table with record backends.
+
+pub mod backend;
+pub mod resolve;
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+/// Current unix time in seconds (single clock for the whole resolver,
+/// so tests can reason about expiry deterministically).
+pub(crate) fn resolve_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Error)]
 pub enum ResolveError {
@@ -15,6 +35,10 @@ pub enum ResolveError {
     InvalidName(String),
     #[error("resolver misconfigured: {0}")]
     Misconfigured(String),
+    #[error("signature verification failed: {0}")]
+    BadSignature(String),
+    #[error("record expired at {0} (now {1})")]
+    Expired(u64, u64),
 }
 
 /// Where a site can be reached.
