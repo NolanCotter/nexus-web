@@ -1,0 +1,10 @@
+[package]
+name = "nexus-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NXP wire protocol: request/response types, parser, serializer"
+
+[lib]
+name = "nexus_protocol"
+path = "src/lib.rs"
