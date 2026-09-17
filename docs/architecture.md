@@ -31,7 +31,7 @@ browser CLI input (site, path)
 | resolver | petname table + Resolver trait | nothing |
 | identity | Ed25519 keys, signed records, expiry | ed25519-dalek |
 | content | Page model, validation, content IDs | blake3, serde_json |
-| storage | MemStore + FsStore CAS, verify-on-read | blake3 |
+| storage | FsStore + MemStore CAS, verify-on-read, 0700/0600 perms, quota+eviction | blake3 |
 | server | SiteStore, one-thread-per-conn TCP | transport, content |
 | renderer | Page -> text | content |
 | webvm | capability Broker, deny-by-default | content |
@@ -42,6 +42,14 @@ browser CLI input (site, path)
 - Request line <= 4096 B; body <= 1 MiB; page <= 1 MiB; blob <= 4 MiB.
 - Site `[a-z0-9-]{1,64}`; path `[A-Za-z0-9/_.\-+]{1,256}`, no `..`, no `//`, no leading `/`.
 - Components <= 4096, depth <= 32, text node <= 256 KiB.
+
+## Storage hardening
+
+- FsStore creates dirs `0700` / blob files `0600` on unix (hardens pre-existing dirs too).
+- Optional per-store quota (`with_quota(max_bytes, max_blobs)`); eviction runs before
+  each write, oldest-first, skipping pinned IDs; unwritable/fully-pinned -> `QuotaExceeded`.
+- Eviction age is file-mtime heuristic (best-effort: mtime is externally mutable).
+- Every `FsStore::get` re-hashes and returns `Corrupt` on mismatch.
 
 ## Roadmap
 
