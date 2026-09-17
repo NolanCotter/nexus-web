@@ -1,0 +1,29 @@
+[package]
+name = "nexus-web-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace: intentionally NOT a member of the root workspace
+# so plain `cargo test --workspace` / `cargo build --workspace` are unaffected.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nexus-protocol = { path = "../crates/protocol" }
+nexus-content = { path = "../crates/content" }
+
+[[bin]]
+name = "parse_request"
+path = "fuzz_targets/parse_request.rs"
+
+[[bin]]
+name = "split_response"
+path = "fuzz_targets/split_response.rs"
+
+[[bin]]
+name = "page_from_json"
+path = "fuzz_targets/page_from_json.rs"
