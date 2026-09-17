@@ -58,11 +58,11 @@ Full `cargo test --workspace` coverage lives in `nix develop`
 (62 passed, 0 failed, verified 2026-09-17 both `--offline` and online)
 and in GitHub CI (networked).
 
-## Known clippy failure under the pinned toolchain (not this lane)
+## Clippy status (resolved 2026-09-17, lead integration)
 
 `cargo clippy --workspace --all-targets -- -D warnings` inside
-`nix develop` (matched 1.98.1/0.1.98) currently fails on a **real lint**,
-not a version skew:
+`nix develop` (matched 1.98.1/0.1.98) failed on **real lints**,
+not version skew (fixed — see below):
 
 ```text
 error: struct `MemoryBackend` has a public `len` method, but no `is_empty` method
@@ -72,9 +72,12 @@ error: struct `MemoryBackend` has a public `len` method, but no `is_empty` metho
 error: could not compile `nexus-resolver` (lib) due to 1 previous error
 ```
 
-This lane may not touch `crates/*/src`. Owning lane fix: add
-`pub fn is_empty(&self) -> bool` to `MemoryBackend` (or allow the lint).
-CI keeps `-D warnings` strict, so CI clippy will stay red until that lands.
+Fixed during lead integration (all green, exit 0): `MemoryBackend::is_empty`
+for the `len-without-is-empty` lint above, `single_match` collapses in the
+adversarial suites, `map_or(true, …)` → `is_some_and` negation (keeps MSRV
+1.75; `is_none_or` needs 1.82), `repeat().take()` → `vec![x; n]`, `format!`
+without args → string literal, never-loop `loop` → single `match`,
+`incoming()` + `if let Ok` → `.flatten()`. CI keeps `-D warnings` strict.
 
 ## `cargo audit` status
 

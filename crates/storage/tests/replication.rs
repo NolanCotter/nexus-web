@@ -122,7 +122,7 @@ fn trailing_garbage_reject() {
     let a = FsStore::new(&dir_a);
     let b = FsStore::new(&dir_b);
     let id = a.put(b"clean data").unwrap();
-    let pack = a.export(&[id.clone()]).unwrap();
+    let pack = a.export(std::slice::from_ref(&id)).unwrap();
 
     let mut evil = pack.clone();
     evil.extend_from_slice(b"GARBAGE");
@@ -158,9 +158,7 @@ fn oversize_reject() {
     // Export refuses to build an overlarge pack too.
     let big_blob = vec![0u8; MAX_BLOB];
     let big_id = a.put(&big_blob).unwrap();
-    let ids: Vec<String> = std::iter::repeat(big_id)
-        .take(MAX_PACK / MAX_BLOB + 2)
-        .collect();
+    let ids: Vec<String> = vec![big_id; MAX_PACK / MAX_BLOB + 2];
     assert!(matches!(a.export(&ids), Err(StoreError::TooLarge(_))));
 
     cleanup(&dir_a);
@@ -193,7 +191,7 @@ fn node_a_to_node_b_serves_page() {
     let node_a = FsStore::new(&dir_a);
     let node_b = FsStore::new(&dir_b);
     let id = node_a.put(&body).unwrap();
-    let pack = node_a.export(&[id.clone()]).unwrap();
+    let pack = node_a.export(std::slice::from_ref(&id)).unwrap();
     let pack_file = dir_pack.join("example-home.nxpack");
     std::fs::write(&pack_file, &pack).unwrap();
 

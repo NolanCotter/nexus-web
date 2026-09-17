@@ -344,8 +344,8 @@ impl FsStore {
         let mut total: u64 = inv.iter().map(|(_, _, s, _)| s).sum();
         let mut count = inv.len();
         let fits = |total: u64, count: usize| {
-            max_bytes.map_or(true, |m| total + incoming_len as u64 <= m)
-                && max_blobs.map_or(true, |m| count + 1 <= m)
+            (!max_bytes.is_some_and(|m| total + incoming_len as u64 > m))
+                && (!max_blobs.is_some_and(|m| count >= m))
         };
         if fits(total, count) {
             return Ok(());

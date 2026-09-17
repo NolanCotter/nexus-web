@@ -388,17 +388,15 @@ Links:
             props: json!({"start": 3}),
         }];
         let s = render_text(&p);
-        let expected = format!(
-            "\
+        let expected = "\
 # Example
 @example /home  rev:1
 
 [app:counter] (not executed)
   requires: storage(512KB), notify
-  props: {{\"start\":3}}
+  props: {\"start\":3}
 
-"
-        );
+";
         assert_eq!(s, expected);
     }
 

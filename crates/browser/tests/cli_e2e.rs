@@ -42,14 +42,12 @@ fn spawn_store() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            if let Ok(stream) = stream {
-                let store = store.clone();
-                std::thread::spawn(move || {
-                    let _ = nexus_server::handle_one(&stream, &store);
-                    let _ = TcpStream::shutdown(&stream, std::net::Shutdown::Both);
-                });
-            }
+        for stream in listener.incoming().flatten() {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let _ = nexus_server::handle_one(&stream, &store);
+                let _ = TcpStream::shutdown(&stream, std::net::Shutdown::Both);
+            });
         }
     });
     addr

@@ -133,18 +133,15 @@ fn adversarial_page_from_json_never_panics() {
     assert!(corpus.len() >= 30, "corpus too small: {}", corpus.len());
     for (i, input) in corpus.iter().enumerate() {
         let r = Page::from_json(input);
-        match r {
-            Ok(page) => {
-                // Any accepted page must validate and round-trip.
-                page.validate()
-                    .unwrap_or_else(|_| panic!("case {i}: from_json accepted an invalid page"));
-                let bytes = page
-                    .to_canonical_json()
-                    .expect("case {i}: re-encode failed");
-                let q = Page::from_json(&bytes).expect("case {i}: round-trip failed");
-                assert_eq!(page, q, "case {i}: round-trip mismatch");
-            }
-            Err(_) => {}
+        if let Ok(page) = r {
+            // Any accepted page must validate and round-trip.
+            page.validate()
+                .unwrap_or_else(|_| panic!("case {i}: from_json accepted an invalid page"));
+            let bytes = page
+                .to_canonical_json()
+                .expect("case {i}: re-encode failed");
+            let q = Page::from_json(&bytes).expect("case {i}: round-trip failed");
+            assert_eq!(page, q, "case {i}: round-trip mismatch");
         }
     }
 }
@@ -187,12 +184,9 @@ fn adversarial_page_link_targets_never_panic() {
         });
         let bytes = serde_json::to_vec(&v).unwrap();
         let r = Page::from_json(&bytes);
-        match r {
-            Ok(p) => {
-                p.validate().expect("accepted page must validate");
-                let _ = p.content_id().expect("content id must compute");
-            }
-            Err(_) => {}
+        if let Ok(p) = r {
+            p.validate().expect("accepted page must validate");
+            let _ = p.content_id().expect("content id must compute");
         }
         let _ = i;
     }

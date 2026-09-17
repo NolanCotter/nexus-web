@@ -345,12 +345,10 @@ mod tests {
         let mut buf = [0u8; 64];
         // Server must close the connection when the read deadline fires:
         // read returns EOF (0) or an error, well within the client timeout.
-        let closed = loop {
-            match s.read(&mut buf) {
-                Ok(0) => break true,
-                Ok(_) => break false, // unexpected data, not a close
-                Err(_) => break start.elapsed() < Duration::from_secs(5),
-            }
+        let closed = match s.read(&mut buf) {
+            Ok(0) => true,
+            Ok(_) => false, // unexpected data, not a close
+            Err(_) => start.elapsed() < Duration::from_secs(5),
         };
         assert!(closed, "slowloris connection was not closed");
         assert!(

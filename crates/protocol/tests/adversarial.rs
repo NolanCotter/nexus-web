@@ -65,15 +65,12 @@ fn adversarial_parse_request_never_panics() {
         let s = String::from_utf8_lossy(input);
         // Contract: must return, never panic.
         let r = parse_request(&s);
-        match r {
-            Ok(req) => {
-                // Any accepted request must re-encode and re-parse cleanly.
-                assert!(!req.site.is_empty(), "case {i}: empty site accepted");
-                assert!(!req.path.is_empty(), "case {i}: empty path accepted");
-                let line = nexus_protocol::encode_request(&req).expect("accepted req must encode");
-                assert_eq!(parse_request(&line).unwrap(), req, "case {i}: not stable");
-            }
-            Err(_) => {}
+        if let Ok(req) = r {
+            // Any accepted request must re-encode and re-parse cleanly.
+            assert!(!req.site.is_empty(), "case {i}: empty site accepted");
+            assert!(!req.path.is_empty(), "case {i}: empty path accepted");
+            let line = nexus_protocol::encode_request(&req).expect("accepted req must encode");
+            assert_eq!(parse_request(&line).unwrap(), req, "case {i}: not stable");
         }
     }
 }
@@ -130,19 +127,16 @@ fn adversarial_split_response_never_panics() {
     assert!(corpus.len() >= 20, "corpus too small: {}", corpus.len());
     for (i, frame) in corpus.iter().enumerate() {
         let r = split_response(frame);
-        match r {
-            Ok((h, body)) => {
-                assert!(
-                    (100..=599).contains(&h.code),
-                    "case {i}: out-of-range code accepted"
-                );
-                assert!(
-                    body.len() == h.body_len,
-                    "case {i}: body len mismatch accepted"
-                );
-                assert!(h.body_len <= MAX_BODY, "case {i}: oversize accepted");
-            }
-            Err(_) => {}
+        if let Ok((h, body)) = r {
+            assert!(
+                (100..=599).contains(&h.code),
+                "case {i}: out-of-range code accepted"
+            );
+            assert!(
+                body.len() == h.body_len,
+                "case {i}: body len mismatch accepted"
+            );
+            assert!(h.body_len <= MAX_BODY, "case {i}: oversize accepted");
         }
         // Header-only path must also never panic on any first-line candidate.
         if let Ok(s) = std::str::from_utf8(frame) {
