@@ -34,6 +34,14 @@ pub enum BrowserError {
     Status(u16, String),
     #[error("bad target '{0}': {1}")]
     BadTarget(String, String),
+    #[error("route pins site {0} but no signed records were provided; refusing to fetch")]
+    PinRecordsRequired(String),
+    #[error("pinned page verification failed for {site}/{path}: {reason}")]
+    PinMismatch {
+        site: String,
+        path: String,
+        reason: String,
+    },
 }
 
 impl From<nexus_storage::StoreError> for BrowserError {
@@ -272,13 +280,74 @@ pub fn fetch_page(endpoint: &str, site: &str, path: &str) -> Result<Page, Browse
 }
 
 /// Resolve `site` via `resolver`, then fetch `path` from the first endpoint.
+/// With no records supplied, any pinned route (`Some` `pinned_site_id`)
+/// fails closed: fetching unverified content is refused.
 pub fn navigate(resolver: &LocalResolver, site: &str, path: &str) -> Result<Page, BrowserError> {
+    navigate_with_records(resolver, site, path, &[])
+}
+
+/// Resolve, fetch, and verify against an explicit chain of signed records.
+///
+/// The server does not serve [`SignedRecord`]s yet (gap — 007 doc), so
+/// records are accepted explicitly instead of fetched from the wire. When
+/// `Route.pinned_site_id` is `Some`, at least one record must match the
+/// pinned site, the path, and the fetched page's BLAKE3 content id.
+pub fn navigate_with_records(
+    resolver: &LocalResolver,
+    site: &str,
+    path: &str,
+    records: &[nexus_identity::SignedRecord],
+) -> Result<Page, BrowserError> {
     let route = resolver.resolve(site)?;
     let endpoint = route
         .endpoints
         .first()
         .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
-    fetch_page(endpoint, site, path)
+    let page = fetch_page(endpoint, site, path)?;
+    if let Some(pinned) = &route.pinned_site_id {
+        if records.is_empty() {
+            return Err(BrowserError::PinRecordsRequired(pinned.clone()));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        verify_pinned(&page, pinned, path, records, now)?;
+    }
+    Ok(page)
+}
+
+/// Fail-closed pin check: at least one record must vouch that the canonical
+/// content id of `page` is what `pinned_site_id` signed for `path`.
+fn verify_pinned(
+    page: &Page,
+    pinned_site_id: &str,
+    path: &str,
+    records: &[nexus_identity::SignedRecord],
+    now_unix: u64,
+) -> Result<(), BrowserError> {
+    let pin_err = |reason: String| BrowserError::PinMismatch {
+        site: pinned_site_id.to_string(),
+        path: path.to_string(),
+        reason,
+    };
+    let key_bytes = hex::decode(pinned_site_id).map_err(|e| pin_err(e.to_string()))?;
+    let identity = nexus_identity::SiteIdentity::from_public_bytes(&key_bytes)
+        .map_err(|e| pin_err(e.to_string()))?;
+    let want = page.content_id().map_err(|e| pin_err(e.to_string()))?;
+    let vouches = records.iter().any(|rec| {
+        rec.record.path == path
+            && rec.record.site == pinned_site_id
+            && rec.record.content_hash == want
+            && identity.verify_record(rec, now_unix).is_ok()
+    });
+    if vouches {
+        Ok(())
+    } else {
+        Err(pin_err(
+            "no signed record matches the fetched content".into(),
+        ))
+    }
 }
 
 /// Resolve `site`, then fetch `path` through `cache` (offline fallback).
@@ -449,5 +518,66 @@ mod tests {
         assert_eq!(h.len(), 2);
         h.forward();
         assert_eq!(h.current().unwrap().path, "b");
+    }
+
+    #[test]
+    fn pinned_route_fails_closed_without_records() {
+        let addr = serve_once(test_page("example", "home"));
+        let mut r = LocalResolver::new();
+        r.insert(
+            "example",
+            nexus_resolver::Route {
+                endpoints: vec![addr.to_string()],
+                pinned_site_id: Some("ab".repeat(32)),
+            },
+        )
+        .unwrap();
+        let err = navigate(&r, "example", "home").unwrap_err();
+        assert!(matches!(err, BrowserError::PinRecordsRequired(_)));
+    }
+
+    #[test]
+    fn pinned_route_accepts_matching_signed_record() {
+        let addr = serve_once(test_page("example", "home"));
+        let id = nexus_identity::SiteIdentity::from_secret_bytes(&[7u8; 32]).unwrap();
+        let rec = id
+            .sign_record(
+                "home",
+                &nexus_content::content_id_of(&test_page("example", "home")),
+                9_999_999_999,
+            )
+            .unwrap();
+        let mut r = LocalResolver::new();
+        r.insert(
+            "example",
+            nexus_resolver::Route {
+                endpoints: vec![addr.to_string()],
+                pinned_site_id: Some(id.site_id()),
+            },
+        )
+        .unwrap();
+        let page = navigate_with_records(&r, "example", "home", &[rec]).unwrap();
+        assert_eq!(page.metadata.title, "T");
+    }
+
+    #[test]
+    fn pinned_route_rejects_tampered_content() {
+        let addr = serve_once(test_page("example", "home"));
+        let id = nexus_identity::SiteIdentity::from_secret_bytes(&[8u8; 32]).unwrap();
+        // Record vouches for a DIFFERENT hash than the served page.
+        let rec = id
+            .sign_record("home", &format!("b3:{}", "ab".repeat(32)), 9_999_999_999)
+            .unwrap();
+        let mut r = LocalResolver::new();
+        r.insert(
+            "example",
+            nexus_resolver::Route {
+                endpoints: vec![addr.to_string()],
+                pinned_site_id: Some(id.site_id()),
+            },
+        )
+        .unwrap();
+        let err = navigate_with_records(&r, "example", "home", &[rec]).unwrap_err();
+        assert!(matches!(err, BrowserError::PinMismatch { .. }));
     }
 }

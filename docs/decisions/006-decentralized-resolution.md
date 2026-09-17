@@ -63,10 +63,11 @@ they are trusted or stored.
   `list_names`), `LocalResolver` petname table, name validation.
 - `Route { endpoints: Vec<String>, pinned_site_id: Option<String> }`.
 
-Missing today, by design: **sequence numbers**. Records carry expiry but no
-version; the local core works because each name is single-source. The first
-multi-source upgrade — before ANY second backend — is `seq` per
-(site, kind) with "newest verified wins".
+Missing today, by design: **sequence numbers** were deferred from v0 and
+landed in M3 (`docs/decisions/009-signed-fetch-path.md`): a monotonic
+per-name `seq` on `EndpointRecord` with "newest verified wins", signed
+revocation tombstones, key rotation/delegation wired into `RecordStore`
+admission, and fail-closed browser pinning against the signed chain.
 
 ## 4. Extension layer (this task, `crates/resolver`)
 
