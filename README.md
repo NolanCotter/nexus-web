@@ -38,13 +38,40 @@ M0 skeleton + M1 first network slice (see `docs/`).
 - Capability-gated sandbox stub (`crates/webvm`)
 - Terminal renderer (`crates/renderer`)
 
-## Run it
+## Quickstart
+
+From the repo root. Prereqs: a Rust stable toolchain
+(`rust-toolchain.toml` pins `stable` + `rustfmt`, `clippy`, `rust-src`;
+verified with `cargo 1.96.2`, plain `cargo` works, `nix develop` optional)
+and `python3` (used by the demo script to pick a free port).
+
+Build:
 
 ```bash
-nix develop
+cargo build -p nexus-server -p nexus-browser
+```
+
+End-to-end demo — serves `sites/example`, fetches `home` + `about`,
+checks a missing page 404s; exits nonzero on any surprise:
+
+```bash
+./demo/e2e.sh
+```
+
+Or the same steps manually:
+
+```bash
+./target/debug/nexus-server --port 7843 --site example --dir sites/example &
+./target/debug/nexus-browser --server 127.0.0.1:7843 --site example --path home
+./target/debug/nexus-browser --server 127.0.0.1:7843 --site example --path about
+./target/debug/nexus-browser --server 127.0.0.1:7843 --site example --path does-not-exist  # expect 404, exit 1
+kill %1
+```
+
+Run the test suite:
+
+```bash
 cargo test --workspace
-cargo run -p nexus-server -- --port 7843 --site sites/example &
-cargo run -p nexus-browser -- --server 127.0.0.1:7843 --site example --path home
 ```
 
 ## Docs
