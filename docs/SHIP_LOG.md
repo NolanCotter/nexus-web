@@ -20,6 +20,7 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #16 CI (fmt+clippy+test) + GitHub push
 - [x] #17 crypto identity research proposal archived (docs/research/)
 - [x] #18 replication primitive: NXPACK1 pack export/import with verify-on-import (crates/storage, ADR 008)
+- [x] #19 unified `nexus` CLI (browse <site[/path]> + interactive back/forward/reload/history)
 - Next: wire signatures into fetch (M3), TUI browser, DHT experiment branch.
 
 ## Notes

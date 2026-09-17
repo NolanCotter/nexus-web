@@ -9,6 +9,12 @@ description = "Reference Nexus CLI browser"
 name = "nexus-browser"
 path = "src/main.rs"
 
+# Unified CLI browser (Milestone F): `nexus browse <site[/path]> [--server ...]`
+# with interactive back/forward navigation. Same crate, same fetch path.
+[[bin]]
+name = "nexus"
+path = "src/bin/nexus.rs"
+
 [lib]
 name = "nexus_browser"
 path = "src/lib.rs"
