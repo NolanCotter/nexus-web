@@ -1,4 +1,4 @@
-# 007 — NXPACK1 replication pack (export/import)
+# 008 — NXPACK1 replication pack (export/import)
 
 - Status: accepted (v0, milestone H)
 - Context: a store must hand a subset of its blobs to another node as exactly
