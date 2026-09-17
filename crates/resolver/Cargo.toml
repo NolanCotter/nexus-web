@@ -1,0 +1,14 @@
+[package]
+name = "nexus-resolver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Name -> identity -> records -> nodes resolution abstraction"
+
+[lib]
+name = "nexus_resolver"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
