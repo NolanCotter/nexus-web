@@ -1,3 +1,6 @@
 [toolchain]
-channel = "stable"
+# Pinned to match flake.nix `rustVersion` and CI. `nix develop` is the
+# canonical path on NixOS (no rustup here, so this file is inert locally;
+# it governs CI's dtolnay/rust-toolchain action). Do not float to "stable".
+channel = "1.98.1"
 components = ["rustfmt", "clippy", "rust-src"]
