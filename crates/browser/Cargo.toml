@@ -19,6 +19,8 @@ nexus-transport = { path = "../transport" }
 nexus-content = { path = "../content" }
 nexus-renderer = { path = "../renderer" }
 nexus-resolver = { path = "../resolver" }
+nexus-identity = { path = "../identity" }
+hex = "0.4"
 serde_json = "1"
 thiserror = "1"
 

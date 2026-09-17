@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use nexus_identity::{Delegation, RotationLog};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, MemoryBackend};
@@ -62,10 +63,12 @@ impl Transport {
     }
 }
 
-/// Signed node/address record: binds a site key to a reachable endpoint.
+/// Signed node/address record. `seq` is the per-name version (see
+/// `docs/decisions/007-signed-fetch-path.md`): admission requires strictly
+/// advancing the name's high-water mark, so stale replays die.
 ///
-/// Field order is fixed for canonical bytes (mirrors `ResourceRecord` in
-/// `crates/identity`): `site \0 transport \0 host \0 port \0 expires`.
+/// Canonical signed bytes (fixed order, never reordered):
+/// `site \0 transport \0 host \0 port \0 seq \0 expires`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointRecord {
     /// Site hex id (pubkey) this record is bound to.
@@ -76,6 +79,9 @@ pub struct EndpointRecord {
     pub host: String,
     /// Port.
     pub port: u16,
+    /// Monotonic per-name version: higher wins, stale replays are dropped.
+    #[serde(default)] // pre-M3 records decode as seq 0 (immediately stale)
+    pub seq: u64,
     /// Unix seconds after which this record is dead.
     pub expires_at_unix: u64,
     /// Ed25519 signature over `canonical_bytes()`, lower-hex.
@@ -91,6 +97,7 @@ impl EndpointRecord {
             &self.transport.to_u8().to_string(),
             self.host.as_str(),
             &self.port.to_string(),
+            &self.seq.to_string(),
             &self.expires_at_unix.to_string(),
         ] {
             out.extend_from_slice(part.as_bytes());
@@ -107,6 +114,7 @@ impl EndpointRecord {
         transport: Transport,
         host: &str,
         port: u16,
+        seq: u64,
         expires_at_unix: u64,
     ) -> Self {
         let record = Self {
@@ -114,6 +122,7 @@ impl EndpointRecord {
             transport,
             host: host.to_string(),
             port,
+            seq,
             expires_at_unix,
             signature_hex: String::new(),
         };
@@ -157,22 +166,101 @@ impl EndpointRecord {
     }
 }
 
+/// Signed revocation tombstone: kills every endpoint record of `site` with
+/// `seq <= max_seq`, permanently, once verified. The signer must be the
+/// target site's own accepted key. Canonical: `site \0 max_seq \0 expires`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revocation {
+    /// Site hex id whose endpoint records are revoked.
+    pub site: String,
+    /// Endpoint records of `site` with `seq <= max_seq` are suppressed.
+    pub max_seq: u64,
+    /// Unix seconds after which this revocation record itself is stale.
+    pub expires_at_unix: u64,
+    /// Ed25519 signature over `canonical_bytes()`, lower-hex.
+    pub signature_hex: String,
+}
+
+impl Revocation {
+    /// Canonical bytes that are signed. Fixed layout, never reordered.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for part in [
+            self.site.as_str(),
+            &self.max_seq.to_string(),
+            &self.expires_at_unix.to_string(),
+        ] {
+            out.extend_from_slice(part.as_bytes());
+            out.push(0);
+        }
+        out.pop();
+        out
+    }
+
+    /// Sign a revocation with the *target site's* key.
+    pub fn sign(signing: &SigningKey, site: &str, max_seq: u64, expires_at_unix: u64) -> Self {
+        let revocation = Self {
+            site: site.to_string(),
+            max_seq,
+            expires_at_unix,
+            signature_hex: String::new(),
+        };
+        let sig = signing.sign(&revocation.canonical_bytes());
+        Self {
+            signature_hex: hex::encode(sig.to_bytes()),
+            ..revocation
+        }
+    }
+
+    /// Strict verification (signature + site match + expiry) against `now`.
+    pub fn verify(&self, verify: &VerifyingKey, now_unix: u64) -> Result<(), ResolveError> {
+        verify_signed(
+            verify,
+            &self.site,
+            &self.canonical_bytes(),
+            self.expires_at_unix,
+            &self.signature_hex,
+            now_unix,
+        )
+    }
+}
+
 /// Clock abstraction: a plain function returning unix seconds. Real code
 /// uses `crate::resolve_now`; tests inject a fixed epoch for determinism.
 pub type Clock = fn() -> u64;
 
-/// Verified, local-first store of endpoint records keyed by name.
+/// A tombstone: endpoint records of `site` with `seq <= max_seq` are dead.
+/// Installed from a signed [`Revocation`] or by a rotation cutover. Permanent:
+/// signatures don't rot (expiry exists for future pruning policy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Tombstone {
+    site: String,
+    max_seq: u64,
+}
+
+/// Verified, local-first cache of endpoint records keyed by name.
 ///
-/// Admission = full verification against the name's trust anchor. No record
-/// enters the store unverified, regardless of which backend delivered it.
-/// Conflict rule (v0): newest-admitted wins per site; the first multi-source
-/// upgrade is per-site sequence numbers (see 006 design doc).
+/// Admission = full verification against the name's accepted keys; no record
+/// enters unverified. Conflict rule (M3): `seq` is a *per-name* high-water
+/// mark shared by all accepted keys — admission requires strictly advancing
+/// it, so newest verified wins and stale replays die; routing picks the
+/// highest live, non-tombstoned seq (pin follows the winner).
 #[derive(Debug)]
 pub struct RecordStore {
     /// Verified records per name.
     records: HashMap<String, Vec<EndpointRecord>>,
-    /// Trust anchors: name → site verifying key (out-of-band, known_hosts).
-    anchors: HashMap<String, VerifyingKey>,
+    /// Revocation/rotation tombstones per name (permanent).
+    tombstones: HashMap<String, Vec<Tombstone>>,
+    /// Accepted keys per name: site hex → key (anchor + rotated + delegated).
+    trusted: HashMap<String, HashMap<String, VerifyingKey>>,
+    /// Name → seq high-water mark.
+    seq_high: HashMap<String, u64>,
+    /// Applied rotation logs (observability/chain discovery).
+    #[allow(dead_code)]
+    rotations: HashMap<String, RotationLog>,
+    /// Accepted delegations (observability/audit).
+    #[allow(dead_code)]
+    delegations: HashMap<String, Vec<Delegation>>,
     /// Time source for expiry checks.
     clock: Clock,
 }
@@ -193,16 +281,22 @@ impl RecordStore {
     pub fn with_clock(clock: Clock) -> Self {
         Self {
             records: HashMap::new(),
-            anchors: HashMap::new(),
+            tombstones: HashMap::new(),
+            trusted: HashMap::new(),
+            seq_high: HashMap::new(),
+            rotations: HashMap::new(),
+            delegations: HashMap::new(),
             clock,
         }
     }
 
-    /// Trust `name` to be anchored at `verify` (out-of-band, like installing
-    /// a DNSSEC root or SSH known_hosts entry). Required before any record
-    /// for the name can be admitted.
+    /// Trust `name` at `verify` (out-of-band, known_hosts-style).
     pub fn trust(&mut self, name: &str, verify: VerifyingKey) {
-        self.anchors.insert(name.to_string(), verify);
+        let site = hex::encode(verify.to_bytes());
+        self.trusted
+            .entry(name.to_string())
+            .or_default()
+            .insert(site, verify);
     }
 
     /// Trust a name anchored at a public key given as 32 raw bytes.
@@ -215,35 +309,173 @@ impl RecordStore {
 
     /// Is `name` anchored (and therefore resolvable at all)?
     pub fn is_trusted(&self, name: &str) -> bool {
-        self.anchors.contains_key(name)
+        self.trusted.get(name).is_some_and(|keys| !keys.is_empty())
     }
 
-    /// Verify `record` against the name's anchor (if any) and admit it.
-    /// Returns `false` for unanchored names and anything that fails
-    /// verification — invalid input is discarded, never stored.
-    pub fn admit(&mut self, name: &str, record: EndpointRecord) -> bool {
-        let Some(verify) = self.anchors.get(name) else {
-            return false;
-        };
-        let now = (self.clock)();
-        if record.verify(verify, now).is_err() {
+    /// Rotation cutover: each trusted `old → new` entry removes the old key,
+    /// tombstones its records up to the high-water mark, and lets the new key
+    /// continue the sequence. Log = policy input; signed carrier is future
+    /// work (007 doc). Chains apply topologically.
+    pub fn rotate(&mut self, name: &str, log: &RotationLog) -> bool {
+        if log.entries.is_empty() || !self.trusted.contains_key(name) {
             return false;
         }
-        // Newest-admitted wins per site (v0 rule).
+        let entries: Vec<(String, String)> = log
+            .entries
+            .iter()
+            .map(|(o, n)| (o.clone(), n.clone()))
+            .collect();
+        let mut applied = false;
+        for _ in 0..=entries.len() {
+            let mut pass = false;
+            for (old_hex, new_hex) in &entries {
+                if old_hex == new_hex {
+                    continue;
+                }
+                let cut = {
+                    let Some(keys) = self.trusted.get_mut(name) else {
+                        continue;
+                    };
+                    if !keys.contains_key(old_hex) {
+                        continue;
+                    }
+                    let Ok(vk) = parse_pubkey(new_hex) else {
+                        continue;
+                    };
+                    let new_site = hex::encode(vk.to_bytes());
+                    if !new_site.eq_ignore_ascii_case(new_hex) {
+                        continue;
+                    }
+                    keys.remove(old_hex);
+                    keys.insert(new_site, vk);
+                    true
+                };
+                if cut {
+                    let hw = *self.seq_high.get(name).unwrap_or(&0);
+                    self.tombstones
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(Tombstone {
+                            site: old_hex.clone(),
+                            max_seq: hw,
+                        });
+                    applied = true;
+                    pass = true;
+                }
+            }
+            if !pass {
+                break;
+            }
+        }
+        if applied {
+            self.rotations
+                .entry(name.to_string())
+                .or_default()
+                .entries
+                .extend(entries);
+        }
+        applied
+    }
+
+    /// Accept a delegation (ed25519-verified, unexpired, `path_prefix`
+    /// covers the `@name` record path) and add the delegate key.
+    pub fn delegate(&mut self, name: &str, d: &Delegation) -> bool {
+        if d.expires_at_unix <= (self.clock)() {
+            return false;
+        }
+        let Ok(vk) = parse_pubkey(&d.delegate_pub_hex) else {
+            return false;
+        };
+        let Some(issuer) = self.trusted.get(name).and_then(|keys| keys.get(&d.site)) else {
+            return false;
+        };
+        if !format!("@{name}").starts_with(&d.path_prefix) {
+            return false;
+        }
+        let Ok(sig) = parse_signature(&d.signature_hex) else {
+            return false;
+        };
+        if issuer.verify_strict(&d.canonical_bytes(), &sig).is_err() {
+            return false;
+        }
+        self.trusted
+            .entry(name.to_string())
+            .or_default()
+            .insert(hex::encode(vk.to_bytes()), vk);
+        self.delegations
+            .entry(name.to_string())
+            .or_default()
+            .push(d.clone());
+        true
+    }
+
+    /// Admit a signed revocation as a permanent tombstone (revoking key =
+    /// an accepted key of `name` whose site the revocation names).
+    pub fn revoke(&mut self, name: &str, revocation: Revocation) -> bool {
+        let Some(vk) = self
+            .trusted
+            .get(name)
+            .and_then(|keys| keys.get(&revocation.site))
+        else {
+            return false;
+        };
+        if revocation.verify(vk, (self.clock)()).is_err() {
+            return false;
+        }
+        let max_seq = revocation.max_seq;
+        self.tombstones
+            .entry(name.to_string())
+            .or_default()
+            .push(Tombstone {
+                site: revocation.site,
+                max_seq,
+            });
+        true
+    }
+
+    /// Do tombstones for `name` suppress `site` records at `seq`?
+    fn tombstoned(&self, name: &str, site: &str, seq: u64) -> bool {
+        self.tombstones
+            .get(name)
+            .is_some_and(|ts| ts.iter().any(|t| t.site == site && seq <= t.max_seq))
+    }
+
+    /// Verify against accepted keys, then admit. Unanchored, unverifiable,
+    /// expired, tombstoned, or non-advancing records are never stored.
+    pub fn admit(&mut self, name: &str, record: EndpointRecord) -> bool {
+        let Some(vk) = self
+            .trusted
+            .get(name)
+            .and_then(|keys| keys.get(&record.site))
+        else {
+            return false;
+        };
+        if record.verify(vk, (self.clock)()).is_err() {
+            return false;
+        }
+        if self.tombstoned(name, &record.site, record.seq) {
+            return false;
+        }
+        let hw = self.seq_high.entry(name.to_string()).or_default();
+        if record.seq <= *hw {
+            return false; // stale replay: must strictly advance the sequence
+        }
+        *hw = record.seq;
         let list = self.records.entry(name.to_string()).or_default();
         list.retain(|r| r.site != record.site);
         list.push(record);
         true
     }
 
-    /// Best valid route for `name`, or `None`.
+    /// Best valid route for `name`, or `None`: highest live, non-tombstoned
+    /// seq wins (newest verified), and routing pins to the winner's site.
     pub fn route(&self, name: &str) -> Option<Route> {
         let now = (self.clock)();
         let records = self.records.get(name)?;
         let live = records
             .iter()
-            .filter(|r| r.expires_at_unix > now)
-            .max_by_key(|r| r.expires_at_unix)?;
+            .filter(|r| r.expires_at_unix > now && !self.tombstoned(name, &r.site, r.seq))
+            .max_by_key(|r| (r.seq, r.expires_at_unix))?;
         Some(Route {
             endpoints: vec![live.endpoint()],
             pinned_site_id: Some(live.site.clone()),
@@ -252,10 +484,64 @@ impl RecordStore {
 
     /// Anchored names (sorted), for `list_names`.
     pub fn known_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.anchors.keys().cloned().collect();
+        let mut names: Vec<String> = self.trusted.keys().cloned().collect();
         names.sort();
         names
     }
+}
+
+/// Parse a 32-byte ed25519 public key from lower-hex.
+fn parse_pubkey(hex_str: &str) -> Result<VerifyingKey, ResolveError> {
+    let bytes = decode_hex(hex_str, 32)?;
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    VerifyingKey::from_bytes(&arr).map_err(|e| ResolveError::BadSignature(e.to_string()))
+}
+
+/// Parse a 64-byte ed25519 signature from lower-hex.
+fn parse_signature(hex_str: &str) -> Result<Signature, ResolveError> {
+    let bytes = decode_hex(hex_str, 64)?;
+    let mut arr = [0u8; 64];
+    arr.copy_from_slice(&bytes);
+    Ok(Signature::from_bytes(&arr))
+}
+
+/// Decode `len` raw bytes from lower-hex.
+fn decode_hex(hex_str: &str, len: usize) -> Result<Vec<u8>, ResolveError> {
+    let bytes = hex::decode(hex_str).map_err(|e| ResolveError::BadSignature(e.to_string()))?;
+    if bytes.len() != len {
+        return Err(ResolveError::BadSignature(format!(
+            "expected {len} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Shared strict verification: site match + expiry + ed25519 `verify_strict`.
+fn verify_signed(
+    verify: &VerifyingKey,
+    site: &str,
+    canonical: &[u8],
+    expires_at_unix: u64,
+    signature_hex: &str,
+    now_unix: u64,
+) -> Result<(), ResolveError> {
+    if site != hex::encode(verify.to_bytes()) {
+        return Err(ResolveError::BadSignature(format!(
+            "site mismatch: record claims {site}, key is {}",
+            hex::encode(verify.to_bytes())
+        )));
+    }
+    if expires_at_unix <= now_unix {
+        return Err(ResolveError::Expired(expires_at_unix, now_unix));
+    }
+    let bytes = decode_hex(signature_hex, 64)?;
+    let mut arr = [0u8; 64];
+    arr.copy_from_slice(&bytes);
+    verify
+        .verify_strict(canonical, &Signature::from_bytes(&arr))
+        .map_err(|e| ResolveError::BadSignature(e.to_string()))
 }
 
 /// Resolver that chains: warm petname table → signed records → backends.
@@ -295,6 +581,17 @@ impl<B: Backend> CachingResolver<B> {
         self.store.lock().unwrap().admit(name, record)
     }
 
+    /// Direct revocation admission; invalidates the warmed table entry so
+    /// the tombstone applies on the next resolve (fast path never re-consults
+    /// backends — see 007 doc gap).
+    pub fn revoke_record(&mut self, name: &str, revocation: Revocation) -> bool {
+        if !self.store.lock().unwrap().revoke(name, revocation) {
+            return false;
+        }
+        self.table.lock().unwrap().remove(name);
+        true
+    }
+
     /// Backends in query order.
     pub fn backends(&self) -> &[B] {
         &self.backends
@@ -318,11 +615,17 @@ impl<B: Backend> Resolver for CachingResolver<B> {
                 if signed.record.path != format!("@{name}") {
                     continue;
                 }
-                // Decode the endpoint payload out of the content hash field
-                // (v0 convention, protocol-lane negotiable).
+                // Decode the endpoint payload (v0 convention: JSON in
+                // content_hash, path "@name"). Revocations ride the same
+                // envelope and become tombstones.
                 let Ok(decoded) =
                     serde_json::from_str::<EndpointRecord>(&signed.record.content_hash)
                 else {
+                    if let Ok(revocation) =
+                        serde_json::from_str::<Revocation>(&signed.record.content_hash)
+                    {
+                        let _ = self.store.lock().unwrap().revoke(name, revocation);
+                    }
                     continue;
                 };
                 let mut store = self.store.lock().unwrap();
@@ -370,16 +673,24 @@ mod tests {
         1_700_000_000
     }
 
-    fn make_record(signing: &SigningKey, host: &str, port: u16) -> EndpointRecord {
+    fn make_record(signing: &SigningKey, host: &str, port: u16, seq: u64) -> EndpointRecord {
         let site = hex::encode(signing.verifying_key().to_bytes());
-        EndpointRecord::sign(signing, &site, Transport::Tcp, host, port, now() + 86_400)
+        EndpointRecord::sign(
+            signing,
+            &site,
+            Transport::Tcp,
+            host,
+            port,
+            seq,
+            now() + 86_400,
+        )
     }
 
     #[test]
     fn endpoint_record_roundtrip() {
         let k = test_key(1);
         let site = hex::encode(k.verifying_key().to_bytes());
-        let rec = make_record(&k, "127.0.0.1", 7843);
+        let rec = make_record(&k, "127.0.0.1", 7843, 1);
         rec.verify(&k.verifying_key(), now()).unwrap();
         assert_eq!(rec.site, site);
         assert_eq!(rec.endpoint(), "127.0.0.1:7843");
@@ -388,7 +699,7 @@ mod tests {
     #[test]
     fn tampered_endpoint_rejected() {
         let k = test_key(2);
-        let mut rec = make_record(&k, "127.0.0.1", 7843);
+        let mut rec = make_record(&k, "127.0.0.1", 7843, 1);
         rec.port = 9999;
         assert!(matches!(
             rec.verify(&k.verifying_key(), now()),
@@ -405,6 +716,7 @@ mod tests {
             Transport::Tcp,
             "127.0.0.1",
             7843,
+            1,
             now() - 10,
         );
         assert!(matches!(
@@ -417,7 +729,7 @@ mod tests {
     fn wrong_site_rejected() {
         let a = test_key(4);
         let b = test_key(5);
-        let rec = make_record(&a, "127.0.0.1", 7843);
+        let rec = make_record(&a, "127.0.0.1", 7843, 1);
         // Verify with B's key: site mismatch must fail.
         assert!(rec.verify(&b.verifying_key(), now()).is_err());
         assert!(matches!(
@@ -430,7 +742,7 @@ mod tests {
     fn unanchored_records_discarded() {
         let k = test_key(6);
         let mut store = RecordStore::with_clock(now);
-        assert!(!store.admit("nobody", make_record(&k, "127.0.0.1", 1)));
+        assert!(!store.admit("nobody", make_record(&k, "127.0.0.1", 1, 1)));
         assert!(store.route("nobody").is_none());
     }
 
@@ -439,7 +751,7 @@ mod tests {
         let k = test_key(7);
         let mut store = RecordStore::with_clock(now);
         store.trust("alice", k.verifying_key());
-        assert!(store.admit("alice", make_record(&k, "10.0.0.1", 7843)));
+        assert!(store.admit("alice", make_record(&k, "10.0.0.1", 7843, 1)));
         let route = store.route("alice").unwrap();
         assert_eq!(route.endpoints, vec!["10.0.0.1:7843"]);
         assert_eq!(
@@ -455,7 +767,7 @@ mod tests {
         let mut store = RecordStore::with_clock(now);
         store.trust("alice", owner.verifying_key());
         // Attacker's record signed by attacker's key: fails site match.
-        assert!(!store.admit("alice", make_record(&attacker, "evil", 666)));
+        assert!(!store.admit("alice", make_record(&attacker, "evil", 666, 1)));
         assert!(store.route("alice").is_none());
     }
 
@@ -465,7 +777,7 @@ mod tests {
         let site = hex::encode(site_key.verifying_key().to_bytes());
 
         // Backend holds a signed endpoint record under path "@alice".
-        let rec = make_record(&site_key, "10.9.9.9", 7843);
+        let rec = make_record(&site_key, "10.9.9.9", 7843, 1);
         let signed = nexus_identity::SignedRecord {
             record: nexus_identity::ResourceRecord {
                 site: site.clone(),
@@ -500,6 +812,150 @@ mod tests {
             CachingResolver::<MemoryBackend>::new(LocalResolver::new(), RecordStore::new(), vec![]);
         assert!(matches!(
             resolver.resolve("nope"),
+            Err(ResolveError::UnknownSite(_))
+        ));
+    }
+
+    // ---- M3: seq, revocation tombstones, key rotation/delegation ----
+
+    #[test]
+    fn seq_newest_wins_stale_replay_rejected() {
+        let k = test_key(11);
+        let mut s = RecordStore::with_clock(now);
+        s.trust("alice", k.verifying_key());
+        assert!(s.admit("alice", make_record(&k, "10.0.0.1", 1, 1)));
+        assert!(s.admit("alice", make_record(&k, "10.0.0.2", 2, 2)));
+        assert_eq!(s.route("alice").unwrap().endpoints, vec!["10.0.0.2:2"]);
+        // Replays — same seq or lower — must be rejected.
+        assert!(!s.admit("alice", make_record(&k, "10.0.0.1", 1, 1)));
+        assert!(!s.admit("alice", make_record(&k, "10.0.0.3", 3, 1)));
+        assert_eq!(s.route("alice").unwrap().endpoints, vec!["10.0.0.2:2"]);
+    }
+
+    #[test]
+    fn revocation_tombstone_suppresses_matching_records() {
+        let k = test_key(12);
+        let site = hex::encode(k.verifying_key().to_bytes());
+        let mut s = RecordStore::with_clock(now);
+        s.trust("alice", k.verifying_key());
+        assert!(s.admit("alice", make_record(&k, "10.0.0.1", 1, 1)));
+        assert!(s.admit("alice", make_record(&k, "10.0.0.2", 2, 2)));
+        assert!(s.revoke("alice", Revocation::sign(&k, &site, 3, now() + 86_400)));
+        assert!(s.route("alice").is_none()); // admitted records now suppressed
+        assert!(!s.admit("alice", make_record(&k, "10.0.0.3", 3, 3))); // at/under tombstone
+        assert!(s.admit("alice", make_record(&k, "10.0.0.4", 4, 4))); // above tombstone
+        assert_eq!(s.route("alice").unwrap().endpoints, vec!["10.0.0.4:4"]);
+    }
+
+    #[test]
+    fn revocation_scoped_and_unforgeable() {
+        let k = test_key(13);
+        let site = hex::encode(k.verifying_key().to_bytes());
+        let mut s = RecordStore::with_clock(now);
+        s.trust("alice", k.verifying_key());
+        assert!(s.admit("alice", make_record(&k, "10.0.0.1", 1, 1)));
+        assert!(s.revoke("alice", Revocation::sign(&k, &site, 1, now() + 86_400)));
+        assert!(s.admit("alice", make_record(&k, "10.0.0.2", 2, 2))); // seq 2 > tombstone
+        assert_eq!(s.route("alice").unwrap().endpoints, vec!["10.0.0.2:2"]);
+        let attacker = test_key(14);
+        assert!(!s.revoke(
+            "alice",
+            Revocation::sign(&attacker, &site, 99, now() + 86_400)
+        ));
+    }
+
+    #[test]
+    fn rotation_cuts_over_to_new_key() {
+        let (a, b) = (test_key(15), test_key(16));
+        let a_hex = hex::encode(a.verifying_key().to_bytes());
+        let b_hex = hex::encode(b.verifying_key().to_bytes());
+        let mut s = RecordStore::with_clock(now);
+        s.trust("alice", a.verifying_key());
+        assert!(s.admit(
+            "alice",
+            EndpointRecord::sign(&a, &a_hex, Transport::Tcp, "10.0.0.1", 1, 1, now() + 86_400)
+        ));
+        let mut log = RotationLog::default();
+        log.entries.insert(a_hex.clone(), b_hex.clone());
+        assert!(s.rotate("alice", &log));
+        // New key continues the sequence; pins follow the winning record.
+        assert!(s.admit(
+            "alice",
+            EndpointRecord::sign(&b, &b_hex, Transport::Tcp, "10.0.0.2", 2, 2, now() + 86_400)
+        ));
+        let route = s.route("alice").unwrap();
+        assert_eq!(route.endpoints, vec!["10.0.0.2:2"]);
+        assert_eq!(route.pinned_site_id.as_deref(), Some(b_hex.as_str()));
+        // Rotated-out key no longer verifies (removed from accepted keys);
+        // its pre-rotation records are tombstoned.
+        assert!(!s.admit(
+            "alice",
+            EndpointRecord::sign(&a, &a_hex, Transport::Tcp, "10.0.0.9", 9, 3, now() + 86_400)
+        ));
+    }
+
+    #[test]
+    fn delegation_admits_scoped_key() {
+        let (owner, dev) = (test_key(17), test_key(18));
+        let owner_hex = hex::encode(owner.verifying_key().to_bytes());
+        let dev_hex = hex::encode(dev.verifying_key().to_bytes());
+        let mut s = RecordStore::with_clock(now);
+        s.trust("alice", owner.verifying_key());
+        let mut d = Delegation {
+            site: owner_hex.clone(),
+            delegate_pub_hex: dev_hex.clone(),
+            path_prefix: "@".into(),
+            expires_at_unix: now() + 86_400,
+            signature_hex: String::new(),
+        };
+        d.signature_hex = hex::encode(owner.sign(&d.canonical_bytes()).to_bytes());
+        assert!(s.delegate("alice", &d));
+        assert!(s.admit(
+            "alice",
+            EndpointRecord::sign(
+                &dev,
+                &dev_hex,
+                Transport::Tcp,
+                "10.0.0.7",
+                7,
+                1,
+                now() + 86_400
+            )
+        ));
+        assert_eq!(
+            s.route("alice").unwrap().pinned_site_id.as_deref(),
+            Some(dev_hex.as_str())
+        );
+        // Unsigned delegation is rejected.
+        let forged = Delegation {
+            site: owner_hex,
+            delegate_pub_hex: hex::encode(test_key(19).verifying_key().to_bytes()),
+            path_prefix: "@".into(),
+            expires_at_unix: now() + 86_400,
+            signature_hex: String::new(),
+        };
+        assert!(!s.delegate("alice", &forged));
+    }
+
+    #[test]
+    fn revoke_invalidates_warmed_table() {
+        let k = test_key(20);
+        let site = hex::encode(k.verifying_key().to_bytes());
+        let mut r = CachingResolver::<MemoryBackend>::new(
+            LocalResolver::new(),
+            RecordStore::with_clock(now),
+            vec![],
+        );
+        r.trust("alice", k.verifying_key());
+        assert!(r.admit_record(
+            "alice",
+            EndpointRecord::sign(&k, &site, Transport::Tcp, "10.0.0.1", 1, 1, now() + 86_400)
+        ));
+        assert!(r.resolve("alice").is_ok()); // warms the petname table
+        assert!(r.revoke_record("alice", Revocation::sign(&k, &site, 1, now() + 86_400)));
+        // Warm entry invalidated + tombstone active: route is gone.
+        assert!(matches!(
+            r.resolve("alice"),
             Err(ResolveError::UnknownSite(_))
         ));
     }
