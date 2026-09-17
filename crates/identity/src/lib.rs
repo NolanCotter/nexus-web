@@ -130,7 +130,7 @@ impl SiteIdentity {
         arr.copy_from_slice(&sig_bytes);
         let sig = Signature::from_bytes(&arr);
         self.verify
-            .verify(&signed.record.canonical_bytes(), &sig)
+            .verify_strict(&signed.record.canonical_bytes(), &sig)
             .map_err(|e| IdentityError::BadSignature(e.to_string()))
     }
 }
