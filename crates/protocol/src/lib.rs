@@ -62,6 +62,9 @@ impl fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
+/// A site name is valid for use on the wire: lowercase alphanumeric/`-`,
+/// within length limits, no leading/trailing dash. This is the single
+/// canonical definition; resolvers and servers must not reimplement it.
 pub fn is_valid_site(s: &str) -> bool {
     if s.is_empty() || s.len() > MAX_SITE_LEN {
         return false;

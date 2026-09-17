@@ -64,15 +64,10 @@ pub trait Resolver: std::fmt::Debug + Send + Sync {
     fn list_names(&self) -> Vec<String>;
 }
 
-pub fn is_valid_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 64 {
-        return false;
-    }
-    name.chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !name.starts_with('-')
-        && !name.ends_with('-')
-}
+/// Petname validity: canonical site-name rule, single-sourced from
+/// [`nexus_protocol::is_valid_site`] so wire parsing and the petname table
+/// can never disagree (same charset, same 64-char limit, same dash rules).
+pub use nexus_protocol::is_valid_site as is_valid_name;
 
 /// Simplest resolver: static in-memory petname table.
 #[derive(Debug, Default, Clone)]
