@@ -1,0 +1,26 @@
+[package]
+name = "nexus-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference Nexus CLI browser"
+
+[[bin]]
+name = "nexus-browser"
+path = "src/main.rs"
+
+[lib]
+name = "nexus_browser"
+path = "src/lib.rs"
+
+[dependencies]
+nexus-protocol = { path = "../protocol" }
+nexus-transport = { path = "../transport" }
+nexus-content = { path = "../content" }
+nexus-renderer = { path = "../renderer" }
+nexus-resolver = { path = "../resolver" }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+nexus-server = { path = "../server" }
