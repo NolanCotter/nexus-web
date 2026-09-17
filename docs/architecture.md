@@ -31,7 +31,7 @@ browser CLI input (site, path)
 | resolver | petname table + Resolver trait | nothing |
 | identity | Ed25519 keys, signed records, expiry | ed25519-dalek |
 | content | Page model, validation, content IDs | blake3, serde_json |
-| storage | MemStore + FsStore CAS, verify-on-read | blake3 |
+| storage | MemStore + FsStore CAS, verify-on-read, NXPACK1 pack export/import | blake3 |
 | server | SiteStore, one-thread-per-conn TCP | transport, content |
 | renderer | Page -> text | content |
 | webvm | capability Broker, deny-by-default | content |

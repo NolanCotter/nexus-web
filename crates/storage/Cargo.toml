@@ -14,3 +14,10 @@ blake3 = "1"
 hex = "0.4"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Replication integration tests: node B serves an imported page over real NXP/TCP.
+# (server is not used: it already depends on storage, which would form a cycle.)
+nexus-content = { path = "../content" }
+nexus-protocol = { path = "../protocol" }
+nexus-transport = { path = "../transport" }
