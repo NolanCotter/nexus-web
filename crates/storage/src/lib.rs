@@ -7,34 +7,46 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// Store failures: I/O problems, missing blobs, oversize puts, and hash
+/// mismatches (corruption or wrong ID).
 #[derive(Debug, Error)]
 pub enum StoreError {
+    /// Filesystem operation failed (carries the OS message).
     #[error("io: {0}")]
     Io(String),
+    /// No blob for this content ID.
     #[error("not found: {0}")]
     NotFound(String),
+    /// Put exceeds [`MAX_BLOB`] (carries the attempted size).
     #[error("too large: {0} bytes")]
     TooLarge(usize),
+    /// Bytes do not match their claimed ID, or the ID is malformed.
     #[error("corrupt: {0}")]
     Corrupt(String),
 }
 
+/// Max bytes accepted by a single put.
 pub const MAX_BLOB: usize = 4 * 1024 * 1024;
 
+/// BLAKE3 content ID (`b3:<hex>`) for raw bytes.
 pub fn id_of(bytes: &[u8]) -> String {
     format!("b3:{}", hex::encode(blake3::hash(bytes).as_bytes()))
 }
 
+/// Volatile content-addressed map: bytes in, content ID out. Dedupes
+/// identical blobs; verification is hash recomputation.
 #[derive(Debug, Default)]
 pub struct MemStore {
     blobs: HashMap<String, Vec<u8>>,
 }
 
 impl MemStore {
+    /// Empty in-memory store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Store bytes, returning their content ID. Idempotent for duplicates.
     pub fn put(&mut self, bytes: &[u8]) -> Result<String, StoreError> {
         if bytes.len() > MAX_BLOB {
             return Err(StoreError::TooLarge(bytes.len()));
@@ -46,6 +58,7 @@ impl MemStore {
         Ok(id)
     }
 
+    /// Fetch blob bytes by content ID.
     pub fn get(&self, id: &str) -> Result<&[u8], StoreError> {
         self.blobs
             .get(id)
@@ -65,10 +78,12 @@ impl MemStore {
         }
     }
 
+    /// Number of distinct blobs held.
     pub fn len(&self) -> usize {
         self.blobs.len()
     }
 
+    /// True when no blobs are held.
     pub fn is_empty(&self) -> bool {
         self.blobs.is_empty()
     }
@@ -81,6 +96,7 @@ pub struct FsStore {
 }
 
 impl FsStore {
+    /// Open (not create) a CAS directory; files materialize on [`FsStore::put`].
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
     }
@@ -99,6 +115,7 @@ impl FsStore {
         Ok(self.dir.join(&hex_part[..2]).join(&hex_part[2..]))
     }
 
+    /// Store bytes durably (atomic temp-file + rename). Idempotent.
     pub fn put(&self, bytes: &[u8]) -> Result<String, StoreError> {
         if bytes.len() > MAX_BLOB {
             return Err(StoreError::TooLarge(bytes.len()));
@@ -118,6 +135,7 @@ impl FsStore {
         Ok(id)
     }
 
+    /// Fetch blob bytes by content ID, verifying the hash on read.
     pub fn get(&self, id: &str) -> Result<Vec<u8>, StoreError> {
         let path = self.path_for(id)?;
         let bytes = std::fs::read(&path).map_err(|_| StoreError::NotFound(id.to_string()))?;
@@ -125,6 +143,7 @@ impl FsStore {
         Ok(bytes)
     }
 
+    /// Backing directory root.
     pub fn dir(&self) -> &Path {
         &self.dir
     }

@@ -231,7 +231,6 @@ dependencies = [
  "nexus-resolver",
  "nexus-server",
  "nexus-transport",
- "serde_json",
  "thiserror",
 ]
 
@@ -254,7 +253,6 @@ dependencies = [
  "hex",
  "rand",
  "serde",
- "serde_json",
  "thiserror",
 ]
 
@@ -276,6 +274,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "nexus-identity",
+ "nexus-protocol",
  "serde",
  "serde_json",
  "thiserror",
@@ -287,11 +286,7 @@ version = "0.1.0"
 dependencies = [
  "nexus-content",
  "nexus-protocol",
- "nexus-resolver",
- "nexus-storage",
  "nexus-transport",
- "serde",
- "serde_json",
  "thiserror",
 ]
 
@@ -301,7 +296,6 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "hex",
- "serde",
  "thiserror",
 ]
 

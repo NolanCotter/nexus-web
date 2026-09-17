@@ -6,6 +6,7 @@
 
 use nexus_content::{Component, LinkTarget, Page};
 
+/// Render a page to human-readable terminal text (pure function).
 pub fn render_text(page: &Page) -> String {
     let mut out = String::new();
     out.push_str(&format!("# {}\n", page.metadata.title));

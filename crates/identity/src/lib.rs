@@ -10,16 +10,22 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Identity failures: malformed keys/signatures, expiry, or wrong site.
 #[derive(Debug, Error)]
 pub enum IdentityError {
+    /// Key bytes were not 32 bytes long (carries the actual length).
     #[error("bad key length: expected 32 bytes, got {0}")]
     BadKeyLen(usize),
+    /// Signature undecodable or verification failed.
     #[error("bad signature: {0}")]
     BadSignature(String),
+    /// Record expired (carries expiry and verification time).
     #[error("record expired at {0} (now {1})")]
     Expired(u64, u64),
+    /// Record's site ID does not match the verifying key.
     #[error("site mismatch: record claims {0}, expected {1}")]
     SiteMismatch(String, String),
+    /// Record serialization failed.
     #[error("serialization: {0}")]
     Serialization(String),
 }
@@ -27,11 +33,14 @@ pub enum IdentityError {
 /// A site identity: an Ed25519 keypair (secret kept locally) or pubkey only.
 #[derive(Debug, Clone)]
 pub struct SiteIdentity {
+    /// Secret key when this side can sign; `None` for verify-only identities.
     pub signing: Option<SigningKey>,
+    /// Public key: the identity. Its hex is the canonical site ID.
     pub verify: VerifyingKey,
 }
 
 impl SiteIdentity {
+    /// Fresh random identity (uses the OS RNG).
     pub fn generate() -> Self {
         use rand::rngs::OsRng;
         let signing = SigningKey::generate(&mut OsRng);
@@ -42,6 +51,7 @@ impl SiteIdentity {
         }
     }
 
+    /// Rebuild a signing identity from 32 secret bytes.
     pub fn from_secret_bytes(secret: &[u8]) -> Result<Self, IdentityError> {
         if secret.len() != 32 {
             return Err(IdentityError::BadKeyLen(secret.len()));
@@ -56,6 +66,7 @@ impl SiteIdentity {
         })
     }
 
+    /// Rebuild a verify-only identity from 32 public bytes.
     pub fn from_public_bytes(public: &[u8]) -> Result<Self, IdentityError> {
         if public.len() != 32 {
             return Err(IdentityError::BadKeyLen(public.len()));
@@ -75,6 +86,7 @@ impl SiteIdentity {
         hex::encode(self.verify.as_bytes())
     }
 
+    /// Raw 32-byte public key.
     pub fn public_bytes(&self) -> [u8; 32] {
         self.verify.to_bytes()
     }
@@ -138,13 +150,18 @@ impl SiteIdentity {
 /// The signed payload. Field order is fixed for canonical bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceRecord {
+    /// Canonical site ID (hex pubkey) this record is bound to.
     pub site: String,
+    /// Content path this record covers.
     pub path: String,
+    /// Content hash the path resolves to.
     pub content_hash: String,
+    /// Unix seconds after which this record must be rejected.
     pub expires_at_unix: u64,
 }
 
 impl ResourceRecord {
+    /// Canonical bytes that are signed. Fixed layout, never reordered.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         // Fixed-field canonical form: site\0path\0content_hash\0expires
         let mut out = Vec::new();
@@ -159,23 +176,32 @@ impl ResourceRecord {
     }
 }
 
+/// A resource record plus its Ed25519 signature (lower-hex, strict verify).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignedRecord {
+    /// The payload that was signed.
     pub record: ResourceRecord,
+    /// Signature over [`ResourceRecord::canonical_bytes`], lower-hex.
     pub signature_hex: String,
 }
 
 /// Delegation: site A authorizes key B to sign for a path prefix until expiry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Delegation {
+    /// Canonical site ID (hex pubkey) granting the delegation.
     pub site: String,
+    /// Authorized delegate public key, lower-hex.
     pub delegate_pub_hex: String,
+    /// Path prefix the delegate may sign for.
     pub path_prefix: String,
+    /// Unix seconds after which the delegation is dead.
     pub expires_at_unix: u64,
+    /// Site-key signature over [`Delegation::canonical_bytes`], lower-hex.
     pub signature_hex: String,
 }
 
 impl Delegation {
+    /// Canonical bytes that are signed. Fixed layout, never reordered.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for part in [
@@ -195,6 +221,7 @@ impl Delegation {
 /// Key rotation log: ordered list of (old_pub -> new_pub) attestations.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RotationLog {
+    /// Map of retired public key (hex) to its successor (hex).
     pub entries: BTreeMap<String, String>,
 }
 

@@ -9,36 +9,59 @@
 
 use std::fmt;
 
+/// Wire version prefix for every request/response line.
 pub const VERSION: &str = "NXP/0.1";
+/// Max bytes of a single header/request line (bounds resource exhaustion).
 pub const MAX_LINE: usize = 4096;
+/// Max bytes of a response body.
 pub const MAX_BODY: usize = 1024 * 1024;
+/// Max bytes of a site name.
 pub const MAX_SITE_LEN: usize = 64;
+/// Max bytes of a content path.
 pub const MAX_PATH_LEN: usize = 256;
 
+/// A parsed `FETCH` request: which site, which path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchRequest {
+    /// Lowercase site name (see [`is_valid_site`]).
     pub site: String,
+    /// Content path, no leading slash (see [`is_valid_path`]).
     pub path: String,
 }
 
+/// A parsed response header: status code plus the exact body length.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseHeader {
+    /// HTTP-style status code (100-599).
     pub code: u16,
+    /// Exact number of body bytes following the header line.
     pub body_len: usize,
 }
 
+/// Every way wire parsing/encoding can fail; never panics on input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
+    /// Request line was empty.
     Empty,
+    /// Header/request line exceeds [`MAX_LINE`].
     LineTooLong,
+    /// Body length exceeds [`MAX_BODY`] (carries the claimed size).
     BodyTooLarge(usize),
+    /// Version prefix is not [`VERSION`].
     BadVersion(String),
+    /// Verb is not `FETCH`.
     BadVerb(String),
+    /// Site name fails [`is_valid_site`].
     BadSite(String),
+    /// Path fails [`is_valid_path`].
     BadPath(String),
+    /// Status code is unparseable or outside 100-599.
     BadCode(String),
+    /// Body length is unparseable.
     BadLength(String),
+    /// Structurally wrong frame (e.g. body/header length mismatch).
     Malformed(String),
+    /// Frame ends before the declared body is complete.
     Truncated,
 }
 
@@ -75,6 +98,9 @@ pub fn is_valid_site(s: &str) -> bool {
         && !s.ends_with('-')
 }
 
+/// A content path is valid when it is non-empty, within limits, relative
+/// (no leading slash), and free of traversal (`..`), empty segments (`//`),
+/// and characters outside `[A-Za-z0-9/_.\-+]`.
 pub fn is_valid_path(s: &str) -> bool {
     if s.is_empty() || s.len() > MAX_PATH_LEN {
         return false;
@@ -86,6 +112,8 @@ pub fn is_valid_path(s: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.' | '+'))
 }
 
+/// Encode a request to its wire line. Fails on invalid site/path so bad
+/// input is caught locally instead of sent to the server.
 pub fn encode_request(req: &FetchRequest) -> Result<String, ProtocolError> {
     if !is_valid_site(&req.site) {
         return Err(ProtocolError::BadSite(req.site.clone()));
@@ -96,6 +124,8 @@ pub fn encode_request(req: &FetchRequest) -> Result<String, ProtocolError> {
     Ok(format!("{VERSION} FETCH {} {}\n", req.site, req.path))
 }
 
+/// Parse one request line (untrusted input). Rejects wrong version/verb,
+/// invalid site/path, and trailing extra tokens with typed errors.
 pub fn parse_request(line: &str) -> Result<FetchRequest, ProtocolError> {
     let line = line.strip_suffix('\n').unwrap_or(line);
     let line = line.strip_suffix('\r').unwrap_or(line);
@@ -133,6 +163,8 @@ pub fn parse_request(line: &str) -> Result<FetchRequest, ProtocolError> {
     })
 }
 
+/// Encode a full response frame (header line + body). Rejects oversize
+/// bodies and out-of-range codes.
 pub fn encode_response(code: u16, body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     if body.len() > MAX_BODY {
         return Err(ProtocolError::BodyTooLarge(body.len()));
@@ -146,7 +178,7 @@ pub fn encode_response(code: u16, body: &[u8]) -> Result<Vec<u8>, ProtocolError>
     Ok(out)
 }
 
-/// Parse a response header line (without consuming body).
+/// Parse a response header line (untrusted input) without consuming the body.
 pub fn parse_response_header(line: &str) -> Result<ResponseHeader, ProtocolError> {
     let line = line.strip_suffix('\n').unwrap_or(line);
     let line = line.strip_suffix('\r').unwrap_or(line);
@@ -175,7 +207,9 @@ pub fn parse_response_header(line: &str) -> Result<ResponseHeader, ProtocolError
     Ok(ResponseHeader { code, body_len })
 }
 
-/// Split a full response frame into header + body.
+/// Split a full response frame into header + body. The body must match the
+/// declared length exactly: short reads are [`ProtocolError::Truncated`],
+/// trailing garbage is [`ProtocolError::Malformed`].
 pub fn split_response(frame: &[u8]) -> Result<(ResponseHeader, &[u8]), ProtocolError> {
     let nl = frame
         .iter()

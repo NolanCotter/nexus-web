@@ -11,15 +11,20 @@ use std::time::Duration;
 use nexus_protocol as nxp;
 use thiserror::Error;
 
+/// Transport failures: protocol violations vs. underlying I/O.
 #[derive(Debug, Error)]
 pub enum TransportError {
+    /// Peer sent bytes that fail [`nexus_protocol`] parsing/limits.
     #[error("protocol: {0}")]
     Protocol(#[from] nxp::ProtocolError),
+    /// Socket/read/write failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
 
+/// Timeout for establishing a TCP connection.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Timeout for a single socket read/write during FETCH.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Read a single `\n`-terminated line, enforcing MAX_LINE.

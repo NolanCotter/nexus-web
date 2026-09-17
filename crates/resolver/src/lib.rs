@@ -11,7 +11,9 @@
 //!   nodes), the verified `RecordStore`, and `CachingResolver` chaining the
 //!   warm petname table with record backends.
 
+/// Pluggable signed-record transports (federated/gossip/DHT + test double).
 pub mod backend;
+/// Signed endpoint records, the verified store, and the caching resolver.
 pub mod resolve;
 
 use std::collections::HashMap;
@@ -26,9 +28,7 @@ use thiserror::Error;
 /// state rather than panic (which would poison every later resolution too).
 /// Every mutation site holds the guard for a single push/retain/insert, so
 /// the recovered state is always a complete map, never a torn write.
-pub(crate) fn lock_ignoring_poison<T>(
-    m: &std::sync::Mutex<T>,
-) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -41,16 +41,24 @@ pub(crate) fn resolve_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Resolution failures: unknown names, invalid input, bad config, or
+/// records that fail verification. Backends never produce these; only the
+/// verifying core does.
 #[derive(Debug, Error)]
 pub enum ResolveError {
+    /// Name is well-formed but has no route or verified record.
     #[error("unknown site: {0}")]
     UnknownSite(String),
+    /// Name fails [`is_valid_name`].
     #[error("invalid name: {0}")]
     InvalidName(String),
+    /// Resolver was given an unusable route (e.g. zero endpoints).
     #[error("resolver misconfigured: {0}")]
     Misconfigured(String),
+    /// Record signature invalid, undecodable, or bound to another key.
     #[error("signature verification failed: {0}")]
     BadSignature(String),
+    /// Record expired (carries expiry and verification time).
     #[error("record expired at {0} (now {1})")]
     Expired(u64, u64),
 }
@@ -65,6 +73,7 @@ pub struct Route {
 }
 
 impl Route {
+    /// Loopback route for local development and tests.
     pub fn local(port: u16) -> Self {
         Self {
             endpoints: vec![format!("127.0.0.1:{port}")],
@@ -73,8 +82,13 @@ impl Route {
     }
 }
 
+/// Name-to-route resolution. Implementations range from the static
+/// [`LocalResolver`] table to the verifying [`resolve::CachingResolver`].
 pub trait Resolver: std::fmt::Debug + Send + Sync {
+    /// Resolve `name` to a [`Route`]. Invalid names fail with
+    /// [`ResolveError::InvalidName`]; unknown names with `UnknownSite`.
     fn resolve(&self, name: &str) -> Result<Route, ResolveError>;
+    /// All names this resolver can answer (sorted for `LocalResolver`).
     fn list_names(&self) -> Vec<String>;
 }
 
@@ -90,10 +104,12 @@ pub struct LocalResolver {
 }
 
 impl LocalResolver {
+    /// Empty petname table.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Bind `name` to `route`. Rejects invalid names and endpoint-less routes.
     pub fn insert(&mut self, name: &str, route: Route) -> Result<(), ResolveError> {
         if !is_valid_name(name) {
             return Err(ResolveError::InvalidName(name.to_string()));
@@ -105,6 +121,7 @@ impl LocalResolver {
         Ok(())
     }
 
+    /// Drop a petname binding (no-op when absent).
     pub fn remove(&mut self, name: &str) {
         self.table.remove(name);
     }

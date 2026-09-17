@@ -8,22 +8,30 @@ use nexus_content::Capability;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Sandbox decision failures: denied capabilities, missing backends, limits.
 #[derive(Debug, Error)]
 pub enum VmError {
+    /// Policy refused the capability (carries the reason).
     #[error("denied: {0}")]
     Denied(String),
+    /// No backend implements this app (v0 has only [`NullBackend`]).
     #[error("not implemented: {0}")]
     NotImplemented(String),
+    /// Granted, but a runtime budget (memory/steps) ran out.
     #[error("resource exhausted: {0}")]
     Exhausted(String),
 }
 
+/// A policy grant for one capability, recorded for audit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Grant {
+    /// Capability kind that was granted (e.g. `"storage"`).
     pub capability: String,
+    /// Debug rendering of the granted request, for the audit log.
     pub scope: String,
 }
 
+/// What the [`Broker`] may grant. Empty `allow` denies everything.
 #[derive(Debug, Clone, Default)]
 pub struct Policy {
     /// Allowed capability kinds, e.g. ["storage", "notify"].
@@ -33,6 +41,7 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// Maximum lockdown: grant nothing.
     pub fn deny_all() -> Self {
         Self {
             allow: vec![],
@@ -40,6 +49,8 @@ impl Policy {
         }
     }
 
+    /// Permissive local-dev policy (storage/network/notify/audio, 1 MiB).
+    /// Never use for untrusted content.
     pub fn allow_all_dev() -> Self {
         Self {
             allow: vec![
@@ -64,6 +75,8 @@ fn kind_of(cap: &Capability) -> &'static str {
     }
 }
 
+/// Capability broker: checks page-requested capabilities against a
+/// [`Policy`], records every decision in an audit log.
 #[derive(Debug)]
 pub struct Broker {
     policy: Policy,
@@ -72,6 +85,7 @@ pub struct Broker {
 }
 
 impl Broker {
+    /// Broker enforcing `policy`, with empty grant set and audit log.
     pub fn new(policy: Policy) -> Self {
         Self {
             policy,
@@ -111,11 +125,13 @@ impl Broker {
         caps.iter().map(|c| self.check(c)).collect()
     }
 
+    /// Drop all grants (audited). In-flight app handles must re-check.
     pub fn revoke_all(&mut self) {
         self.granted.clear();
         self.log.push("REVOKE ALL".to_string());
     }
 
+    /// Ordered ALLOW/DENY/REVOKE audit entries.
     pub fn audit_log(&self) -> &[String] {
         &self.log
     }
@@ -123,9 +139,11 @@ impl Broker {
 
 /// Future execution backend (WASM). Stubbed for v0.
 pub trait Backend: Send {
+    /// Run `app_id` with `props`, returning its output text.
     fn run(&mut self, app_id: &str, props: &serde_json::Value) -> Result<String, VmError>;
 }
 
+/// Backend that implements nothing: every run fails with `NotImplemented`.
 #[derive(Debug, Default)]
 pub struct NullBackend;
 
