@@ -1,25 +1,3 @@
 [workspace]
 resolver = "2"
-members = [
-  "crates/protocol",
-  "crates/identity",
-  "crates/resolver",
-  "crates/transport",
-  "crates/content",
-  "crates/storage",
-  "crates/server",
-  "crates/renderer",
-  "crates/webvm",
-  "crates/browser",
-]
-
-[workspace.package]
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
-repository = "https://github.com/NolanCotter/nexus-web"
-rust-version = "1.75"
-
-[workspace.lints.rust]
-unsafe_code = "forbid"
-missing_debug_implementations = "warn"
+members = ["crates/nxp-proto"]
