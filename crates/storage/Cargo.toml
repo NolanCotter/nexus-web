@@ -1,0 +1,16 @@
+[package]
+name = "nexus-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Content-addressed immutable store"
+
+[lib]
+name = "nexus_storage"
+path = "src/lib.rs"
+
+[dependencies]
+blake3 = "1"
+hex = "0.4"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
