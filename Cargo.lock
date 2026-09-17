@@ -230,7 +230,10 @@ dependencies = [
  "nexus-renderer",
  "nexus-resolver",
  "nexus-server",
+ "nexus-storage",
  "nexus-transport",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

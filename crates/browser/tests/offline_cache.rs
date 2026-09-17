@@ -1,0 +1,125 @@
+//! Milestone G: offline-first cache behavior over real loopback TCP:
+//! stale-after-server-death, corruption-as-miss + eviction, revision replace.
+
+use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
+use std::thread::JoinHandle;
+
+use nexus_browser::{BrowserError, CacheStatus, OfflineCache};
+use nexus_content::{Component, Metadata, Page};
+
+fn page_bytes(revision: u64) -> Vec<u8> {
+    Page {
+        metadata: Metadata {
+            schema: 1,
+            site: "example".into(),
+            path: "home".into(),
+            title: "T".into(),
+            revision,
+        },
+        components: vec![Component::Text { text: "hi".into() }],
+        capabilities: vec![],
+    }
+    .to_canonical_json()
+    .unwrap()
+}
+
+/// Server that answers exactly one request, then dies (listener dropped,
+/// port closed). Joining the handle is the deterministic "kill server".
+fn serve_once(bytes: Vec<u8>) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut store = nexus_server::SiteStore::new();
+        store.insert("example", "home", bytes);
+        let (stream, _) = listener.accept().unwrap();
+        nexus_server::handle_one(&stream, &store).unwrap();
+    });
+    (addr, handle)
+}
+
+fn temp_dir(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("nexus-offline-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+#[test]
+fn offline_fetch_returns_stale_after_server_dies() {
+    let dir = temp_dir("stale");
+    let cache = OfflineCache::new(&dir);
+    let (addr, server) = serve_once(page_bytes(1));
+
+    let (page, status) = cache.fetch(&addr.to_string(), "example", "home").unwrap();
+    assert!(matches!(status, CacheStatus::Fresh));
+    assert_eq!(page.metadata.revision, 1);
+
+    server.join().unwrap(); // server dead: port closed
+
+    let (page2, status2) = cache.fetch(&addr.to_string(), "example", "home").unwrap();
+    assert!(matches!(status2, CacheStatus::Stale));
+    assert_eq!(page2.metadata.revision, 1);
+    assert_eq!(page2.to_canonical_json().unwrap(), page_bytes(1)); // identical content
+
+    // Cold cache + dead server: transport error must propagate (no phantom page).
+    let cache2 = OfflineCache::new(temp_dir("stale-cold"));
+    let err = cache2
+        .fetch(&addr.to_string(), "example", "home")
+        .unwrap_err();
+    assert!(matches!(err, BrowserError::Transport(_)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn corrupt_blob_is_miss_and_evicted() {
+    let dir = temp_dir("corrupt");
+    let cache = OfflineCache::new(&dir);
+    let (addr, server) = serve_once(page_bytes(1));
+    cache.fetch(&addr.to_string(), "example", "home").unwrap();
+    server.join().unwrap();
+
+    // Flip a byte inside the stored blob (length-preserving): BLAKE3 must
+    // reject it before any parsing/validation even runs.
+    let idx: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("index.json")).unwrap()).unwrap();
+    let cid = idx["pages"]["example\u{1f}home"]["content_id"]
+        .as_str()
+        .unwrap();
+    let blob = dir.join("blobs").join(&cid[3..5]).join(&cid[5..]);
+    let mut bad = std::fs::read(&blob).unwrap();
+    *bad.last_mut().unwrap() ^= 0xff;
+    std::fs::write(&blob, bad).unwrap();
+
+    let err = cache
+        .fetch(&addr.to_string(), "example", "home")
+        .unwrap_err();
+    assert!(matches!(err, BrowserError::Transport(_)));
+
+    // The poisoned entry was evicted from the index.
+    let idx: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("index.json")).unwrap()).unwrap();
+    assert!(idx["pages"].get("example\u{1f}home").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fresh_server_revision_replaces_cached_copy() {
+    let dir = temp_dir("rev");
+    let cache = OfflineCache::new(&dir);
+    let (addr, server) = serve_once(page_bytes(1));
+    cache.fetch(&addr.to_string(), "example", "home").unwrap();
+    server.join().unwrap();
+
+    // Server returns with revision 2 on a new port (cache keys by site+path).
+    let (addr2, server2) = serve_once(page_bytes(2));
+    let (page, status) = cache.fetch(&addr2.to_string(), "example", "home").unwrap();
+    assert!(matches!(status, CacheStatus::Fresh));
+    assert_eq!(page.metadata.revision, 2);
+    server2.join().unwrap();
+
+    // Offline now serves the new revision, not the superseded one.
+    let (page2, status2) = cache.fetch(&addr2.to_string(), "example", "home").unwrap();
+    assert!(matches!(status2, CacheStatus::Stale));
+    assert_eq!(page2.metadata.revision, 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}

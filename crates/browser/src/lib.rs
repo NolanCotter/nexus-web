@@ -1,6 +1,11 @@
 //! CLI browser core: resolve petname -> endpoint, FETCH, parse, render.
 //!
 //! Navigation history is a simple past/present/future stack (no tabs).
+//! [`cache`] adds the offline-first disk page cache (Milestone G).
+
+pub mod cache;
+
+pub use cache::{CacheStatus, OfflineCache};
 
 use nexus_content::Page;
 use nexus_resolver::{LocalResolver, ResolveError, Resolver, Route};
@@ -23,13 +28,22 @@ pub enum BrowserError {
     #[error("content: {0}")]
     Content(String),
     /// Server answered with a non-200 status.
+    #[error("cache: {0}")]
+    Cache(String),
     #[error("server returned {0}: {1}")]
     Status(u16, String),
     #[error("bad target '{0}': {1}")]
     BadTarget(String, String),
 }
 
+impl From<nexus_storage::StoreError> for BrowserError {
+    fn from(e: nexus_storage::StoreError) -> Self {
+        BrowserError::Cache(e.to_string())
+    }
+}
+
 /// One history entry: where we went plus the parsed page we saw.
+
 #[derive(Debug, Clone)]
 pub struct Visit {
     /// Site that was visited.
@@ -265,6 +279,22 @@ pub fn navigate(resolver: &LocalResolver, site: &str, path: &str) -> Result<Page
         .first()
         .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
     fetch_page(endpoint, site, path)
+}
+
+/// Resolve `site`, then fetch `path` through `cache` (offline fallback).
+/// Returns the page plus its [`CacheStatus`] banner marker.
+pub fn navigate_cached(
+    resolver: &LocalResolver,
+    cache: &OfflineCache,
+    site: &str,
+    path: &str,
+) -> Result<(Page, CacheStatus), BrowserError> {
+    let route = resolver.resolve(site)?;
+    let endpoint = route
+        .endpoints
+        .first()
+        .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
+    cache.fetch(endpoint, site, path)
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use nexus_browser::{fetch_page, navigate};
+use nexus_browser::{navigate_cached, CacheStatus, OfflineCache};
 use nexus_resolver::{LocalResolver, Route};
 
 fn usage() -> &'static str {
@@ -56,10 +56,12 @@ fn main() {
         std::process::exit(2);
     }
 
-    match navigate(&resolver, &site, &path) {
-        Ok(page) => {
-            // Validate fetch path independently (direct fetch parity check).
-            let _ = fetch_page(&server, &site, &path);
+    let cache = OfflineCache::open_default();
+    match navigate_cached(&resolver, &cache, &site, &path) {
+        Ok((page, status)) => {
+            if let CacheStatus::Stale = status {
+                println!("[STALE (offline)] served from local cache");
+            }
             print!("{}", nexus_renderer::render_text(&page));
         }
         Err(e) => {
