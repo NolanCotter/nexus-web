@@ -13,7 +13,6 @@ path = "src/lib.rs"
 blake3 = "1"
 hex = "0.4"
 thiserror = "1"
-serde = { version = "1", features = ["derive"] }
 
 [lints]
 workspace = true

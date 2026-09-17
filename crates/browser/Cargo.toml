@@ -19,7 +19,6 @@ nexus-transport = { path = "../transport" }
 nexus-content = { path = "../content" }
 nexus-renderer = { path = "../renderer" }
 nexus-resolver = { path = "../resolver" }
-serde_json = "1"
 thiserror = "1"
 
 [dev-dependencies]
