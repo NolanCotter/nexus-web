@@ -1,0 +1,13 @@
+[package]
+name = "nexus-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal renderer for Nexus pages"
+
+[lib]
+name = "nexus_renderer"
+path = "src/lib.rs"
+
+[dependencies]
+nexus-content = { path = "../content" }
