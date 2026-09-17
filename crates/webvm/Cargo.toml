@@ -1,0 +1,16 @@
+[package]
+name = "nexus-webvm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Capability-gated sandbox stub for interactive components"
+
+[lib]
+name = "nexus_webvm"
+path = "src/lib.rs"
+
+[dependencies]
+nexus-content = { path = "../content" }
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
