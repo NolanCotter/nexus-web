@@ -1,0 +1,41 @@
+{
+  "metadata": {
+    "schema": 1,
+    "site": "example",
+    "path": "showcase",
+    "title": "Renderer showcase",
+    "revision": 1
+  },
+  "components": [
+    { "type": "heading", "level": 1, "text": "Showcase" },
+    { "type": "heading", "level": 2, "text": "Wrapping" },
+    { "type": "text", "text": "This paragraph is deliberately longer than eighty columns so the terminal renderer must wrap it with a simple greedy word wrap that never hyphenates words." },
+    { "type": "heading", "level": 2, "text": "Links" },
+    { "type": "text", "text": "Pick a destination:" },
+    { "type": "link", "label": "About this experiment", "target": { "kind": "page", "site": "example", "path": "about" } },
+    { "type": "link", "label": "External docs", "target": { "kind": "external", "hint": "example.net/docs" } },
+    { "type": "link", "label": "Do the thing", "target": { "kind": "action", "action_id": "do-thing" } },
+    { "type": "heading", "level": 2, "text": "Nested list" },
+    {
+      "type": "collection",
+      "items": [
+        { "type": "text", "text": "Identity over domain names." },
+        {
+          "type": "collection",
+          "items": [
+            { "type": "text", "text": "Content over servers." },
+            { "type": "link", "label": "Back home", "target": { "kind": "page", "site": "example", "path": "home" } }
+          ]
+        },
+        { "type": "text", "text": "Capabilities over ambient authority." }
+      ]
+    },
+    { "type": "heading", "level": 3, "text": "Media and apps" },
+    { "type": "image", "content_id": "b3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "alt": "Demo image" },
+    { "type": "app", "app_id": "counter", "props": { "start": 3 } }
+  ],
+  "capabilities": [
+    { "kind": "storage", "max_kb": 512 },
+    { "kind": "notify" }
+  ]
+}
