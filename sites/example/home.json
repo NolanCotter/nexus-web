@@ -1,0 +1,23 @@
+{
+  "metadata": {
+    "schema": 1,
+    "site": "example",
+    "path": "home",
+    "title": "Hello, Nexus",
+    "revision": 1
+  },
+  "components": [
+    { "type": "heading", "level": 1, "text": "Hello, Nexus" },
+    { "type": "text", "text": "This page has no HTML. It is a typed object, fetched over NXP and rendered natively." },
+    { "type": "link", "label": "About this experiment", "target": { "kind": "page", "site": "example", "path": "about" } },
+    {
+      "type": "collection",
+      "items": [
+        { "type": "text", "text": "Identity over domain names." },
+        { "type": "text", "text": "Content over servers." },
+        { "type": "text", "text": "Capabilities over ambient authority." }
+      ]
+    }
+  ],
+  "capabilities": []
+}

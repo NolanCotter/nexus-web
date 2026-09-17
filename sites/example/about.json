@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "schema": 1,
+    "site": "example",
+    "path": "about",
+    "title": "About Nexus",
+    "revision": 1
+  },
+  "components": [
+    { "type": "heading", "level": 1, "text": "What is Nexus?" },
+    { "type": "text", "text": "An experimental alternative web architecture built from first principles. Not production-ready; nothing here claims to be secure, decentralized, or scalable yet." },
+    { "type": "link", "label": "Back home", "target": { "kind": "page", "site": "example", "path": "home" } }
+  ],
+  "capabilities": []
+}
