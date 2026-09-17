@@ -273,7 +273,11 @@ dependencies = [
 name = "nexus-resolver"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "nexus-identity",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
