@@ -11,3 +11,6 @@ path = "src/lib.rs"
 
 [dependencies]
 nexus-content = { path = "../content" }
+
+[dev-dependencies]
+serde_json = "1"

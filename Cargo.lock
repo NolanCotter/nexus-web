@@ -267,6 +267,7 @@ name = "nexus-renderer"
 version = "0.1.0"
 dependencies = [
  "nexus-content",
+ "serde_json",
 ]
 
 [[package]]
