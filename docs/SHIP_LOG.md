@@ -21,10 +21,25 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #17 crypto identity research proposal archived (docs/research/)
 - [x] #18 replication primitive: NXPACK1 pack export/import with verify-on-import (crates/storage, ADR 008)
 - [x] #19 unified `nexus` CLI (browse <site[/path]> + interactive back/forward/reload/history)
-- Next: wire signatures into fetch (M3), TUI browser, DHT experiment branch.
+- [x] #20 storage hardening: 0700/0600 perms, quota+eviction, corruption tests
+- [x] #21 server conn caps (503), slowloris deadlines, EOF→Truncated mapping
+- [x] #22 demo/e2e.sh smoke test + verified README quickstart
+- [x] #23 richer terminal renderer (wrap, link index, placeholders) + showcase page
+- [x] #24 cargo-fuzz skeleton + deterministic adversarial corpus (protocol/content)
+- [x] #25 Resource envelope over Page (ADR 007): identity+version+references
+- [x] #26 workspace audit: poison-proof locks, rustdoc, validation dedup, dep hygiene
+- [x] #27 NXPACK1 merged (see #18); ADR renumbered to 008
+- [x] #28 identity v1 domain-separated signatures, 0600 key files, rotation chains
+- [x] #29 pinned Nix toolchain (1.98.1), hermetic `nix flake check`, CI audit step
+- [x] #30 clippy `-D warnings` green under pinned toolchain (8 findings fixed)
+- [x] #31 offline-first browser cache with stale fallback (Milestone G)
+- [x] #32 resolver M3: seq, revocation tombstones, pin enforcement, rotation (ADR 009)
+- Next: security-test battery, records endpoint on server (M3 gap 1), TUI browser, DHT past gates.
 
-## Notes
-- `cargo fmt --all` clean; `cargo test --workspace` green (53 tests).
-- `cargo clippy` blocked on this machine: system clippy 0.1.97 vs rustc 1.96.1
-  (E0514 incompatible crate artifacts). CI runs clippy with a matched toolchain;
-  use `nix develop` (pinned toolchain) locally until the system set is aligned.
+## Notes (wave 2, 2026-09-17)
+- `cargo test --workspace`: 141+ passed, 0 failed. `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: green under
+  `nix develop` (pinned 1.98.1). System clippy still mismatched — use nix.
+- `nix flake check`: all checks passed (verified locally).
+- Lanes work in `wave2/*` branches + `/tmp/opencode` worktrees; main only
+  takes reviewed merges. Research drafts live on `experiment/*` branches.
