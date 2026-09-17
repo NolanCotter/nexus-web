@@ -20,6 +20,8 @@ use std::fmt::Debug;
 
 use nexus_identity::SignedRecord;
 
+use crate::lock_ignoring_poison;
+
 /// Transport-level backend failure (distinct from resolution semantics).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendError {
@@ -180,7 +182,7 @@ impl MemoryBackend {
 
     /// Record count (test assertions).
     pub fn len(&self) -> usize {
-        self.records.lock().unwrap().len()
+        lock_ignoring_poison(&self.records).len()
     }
 }
 
@@ -190,9 +192,7 @@ impl Backend for MemoryBackend {
     }
 
     fn fetch(&self, name: &str) -> Vec<SignedRecord> {
-        self.records
-            .lock()
-            .unwrap()
+        lock_ignoring_poison(&self.records)
             .iter()
             .filter(|r| r.record.path == format!("@{name}"))
             .cloned()
@@ -200,7 +200,7 @@ impl Backend for MemoryBackend {
     }
 
     fn advertise(&self, record: &SignedRecord) -> Result<(), BackendError> {
-        self.records.lock().unwrap().push(record.clone());
+        lock_ignoring_poison(&self.records).push(record.clone());
         Ok(())
     }
 }

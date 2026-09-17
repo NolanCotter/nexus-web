@@ -18,6 +18,20 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+/// Acquire a cache mutex, tolerating poisoning.
+///
+/// A poisoned mutex means some earlier holder panicked mid-critical-section.
+/// Resolver caches are read-mostly maps of owned, self-consistent values, so
+/// the safe choice on a live resolution path is to carry on with the guarded
+/// state rather than panic (which would poison every later resolution too).
+/// Every mutation site holds the guard for a single push/retain/insert, so
+/// the recovered state is always a complete map, never a torn write.
+pub(crate) fn lock_ignoring_poison<T>(
+    m: &std::sync::Mutex<T>,
+) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Current unix time in seconds (single clock for the whole resolver,
 /// so tests can reason about expiry deterministically).
 pub(crate) fn resolve_now() -> u64 {
