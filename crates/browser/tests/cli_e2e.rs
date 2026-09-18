@@ -158,3 +158,56 @@ fn nexus_sync_verified_mirrors_with_chain() {
     assert!(dir.join("home.json").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn nexus_export_pack_imports_into_fresh_store() {
+    // Signed origin: page + chain.
+    let mut store = nexus_server::SiteStore::new();
+    store.insert(
+        "example",
+        "home",
+        page_bytes("example", "home", "Example Home"),
+    );
+    let id = nexus_identity::SiteIdentity::from_secret_bytes(&[61u8; 32]).unwrap();
+    store.sign_pages(&id, 9_999_999_999).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        // LIST + RECORDS + FETCH.
+        for _ in 0..3 {
+            let (stream, _) = listener.accept().unwrap();
+            nexus_server::handle_one(&stream, &store).unwrap();
+        }
+    });
+    let pack = std::env::temp_dir().join(format!("nexus-export-e2e-{}.nxpack", std::process::id()));
+    let _ = std::fs::remove_file(&pack);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nexus"))
+        .args([
+            "export",
+            "--server",
+            &addr.to_string(),
+            "--site",
+            "example",
+            "--out",
+            pack.to_str().unwrap(),
+            "--pin",
+            &id.site_id(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+
+    // Fresh store imports the pack and serves the page + chain.
+    let bytes = std::fs::read(&pack).unwrap();
+    let mut store2 = nexus_server::SiteStore::new();
+    let report = store2.load_pack(&bytes).unwrap();
+    assert_eq!((report.pages, report.chains), (1, 1));
+    let page = nexus_content::Page::from_json(store2.get("example", "home").unwrap()).unwrap();
+    assert_eq!(page.metadata.title, "Example Home");
+    let records: Vec<nexus_identity::SignedRecord> =
+        serde_json::from_slice(store2.get_records("example", "home").unwrap()).unwrap();
+    id.verify_record(&records[0], 1_000_000).unwrap();
+    let _ = std::fs::remove_file(&pack);
+}

@@ -97,6 +97,118 @@ impl SiteStore {
         v.sort();
         v
     }
+} // end impl SiteStore (pages, records, endpoint plane)
+
+/// Outcome of [`SiteStore::load_pack`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackReport {
+    /// Page blobs admitted (validated + wire-legal site/path).
+    pub pages: usize,
+    /// Record chains admitted.
+    pub chains: usize,
+    /// Blobs that were neither (skipped, still hash-verified).
+    pub skipped: usize,
+}
+
+impl SiteStore {
+    // (pack import methods live here so pages/records share one impl)
+    /// Load a site from an NXPACK1 pack (sneakernet import): every blob is
+    /// hash-verified by the pack decoder first; then each blob is tried as
+    /// a page (validated, wire-legal metadata) and otherwise as a record
+    /// chain (every record's site/path validated). Anything else is
+    /// skipped but counted. Pages land under their own metadata
+    /// (site, path); chains merge per route (replace, like `sign_pages`).
+    pub fn load_pack(&mut self, pack: &[u8]) -> Result<PackReport, ServerError> {
+        let blobs = nexus_storage::FsStore::unpack(pack)
+            .map_err(|e| ServerError::Content(e.to_string()))?;
+        let mut report = PackReport {
+            pages: 0,
+            chains: 0,
+            skipped: 0,
+        };
+        // Pass 1: pages land under their own metadata (site, path).
+        let mut chain_blobs: Vec<&Vec<u8>> = Vec::new();
+        for bytes in blobs.iter().map(|(_, b)| b) {
+            if let Ok(page) = nexus_content::Page::from_json(bytes) {
+                if nxp::is_valid_site(&page.metadata.site)
+                    && nxp::is_valid_path(&page.metadata.path)
+                {
+                    self.pages.insert(
+                        (page.metadata.site.clone(), page.metadata.path.clone()),
+                        bytes.to_vec(),
+                    );
+                    report.pages += 1;
+                    continue;
+                }
+            }
+            if serde_json::from_slice::<Vec<serde_json::Value>>(bytes)
+                .map(|records| Self::valid_chain(&records))
+                .unwrap_or(false)
+            {
+                chain_blobs.push(bytes);
+                continue;
+            }
+            report.skipped += 1;
+        }
+        // Pass 2: chains bind to the ROUTE they vouch for — the page with
+        // the same path — because record sites are key hexes while routes
+        // are petnames. A chain with no page of its path keeps its own key
+        // (still servable by exact lookup, still verifiable).
+        for bytes in chain_blobs {
+            let records: Vec<serde_json::Value> =
+                serde_json::from_slice(bytes).expect("re-parses: validated in pass 1");
+            let path = records[0]["record"]["path"].as_str().unwrap_or_default();
+            let route_site = self
+                .pages
+                .keys()
+                .find(|(_, p)| p == path)
+                .map(|(site, _)| site.clone())
+                .unwrap_or_else(|| {
+                    records[0]["record"]["site"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                });
+            self.records
+                .insert((route_site, path.to_string()), bytes.to_vec());
+            report.chains += 1;
+        }
+        Ok(report)
+    }
+
+    /// Every element must look like a `SignedRecord` with wire-legal
+    /// site/path, all naming the SAME route (one chain, one route).
+    fn valid_chain(records: &[serde_json::Value]) -> bool {
+        if records.is_empty() {
+            return false;
+        }
+        let (mut site, mut path) = (None, None);
+        for r in records {
+            let s = r["record"]["site"].as_str().unwrap_or_default();
+            let p = r["record"]["path"].as_str().unwrap_or_default();
+            let sig = r["signature_hex"].as_str().unwrap_or_default();
+            if !nxp::is_valid_site(s) || s.is_empty() {
+                return false;
+            }
+            if p.is_empty()
+                || (!nxp::is_valid_path(p) && !(p.starts_with('@') && nxp::is_valid_site(&p[1..])))
+            {
+                return false;
+            }
+            if sig.is_empty() {
+                return false;
+            }
+            match (&site, &path) {
+                (None, None) => {
+                    site = Some(s);
+                    path = Some(p);
+                }
+                _ if site != Some(s) || path != Some(p) => return false,
+                _ => {}
+            }
+        }
+        true
+    }
 
     /// Install the identity + TTL used for background re-signing. The next
     /// [`SiteStore::sign_pages`] call (manual or via the re-signer thread in
@@ -802,6 +914,73 @@ mod tests {
         std::fs::write(dir.join("endpoints").join("BAD.json"), b"[]").unwrap();
         let mut bad2 = SiteStore::new();
         assert!(bad2.load_dir("example", &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_pack_roundtrip_pages_and_chains() {
+        use nexus_identity::SiteIdentity;
+        let dir = std::env::temp_dir().join(format!("nexus-pack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fs = nexus_storage::FsStore::new(&dir);
+        let page = page_bytes("example", "home");
+        let page_id = fs.put(&page).unwrap();
+        let id = SiteIdentity::generate();
+        let content_id = nexus_content::Page::from_json(&page)
+            .unwrap()
+            .content_id()
+            .unwrap();
+        let chain =
+            serde_json::to_vec(&[id.sign_record("home", &content_id, 9_999_999_999).unwrap()])
+                .unwrap();
+        let chain_id = fs.put(&chain).unwrap();
+        // An opaque blob rides along and is skipped, not admitted.
+        let junk_id = fs.put(b"just bytes").unwrap();
+        let pack = fs.export(&[page_id, chain_id, junk_id]).unwrap();
+
+        let mut store = SiteStore::new();
+        let report = store.load_pack(&pack).unwrap();
+        assert_eq!((report.pages, report.chains, report.skipped), (1, 1, 1));
+        assert!(store.get("example", "home").is_some());
+        // The chain verifies against the loaded page.
+        let records: Vec<nexus_identity::SignedRecord> =
+            serde_json::from_slice(store.get_records("example", "home").unwrap()).unwrap();
+        id.verify_record(&records[0], 1_000_000).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_pack_rejects_tampered_and_bad_metadata() {
+        let dir = std::env::temp_dir().join(format!("nexus-pack-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fs = nexus_storage::FsStore::new(&dir);
+        let id = fs.put(b"nope").unwrap();
+        let mut pack = fs.export(&[id]).unwrap();
+        // Flip a payload byte: whole pack rejected, store untouched.
+        let flip_at = pack.len() - 1;
+        pack[flip_at] ^= 0xff;
+        let mut store = SiteStore::new();
+        assert!(store.load_pack(&pack).is_err());
+        assert!(store.get("example", "home").is_none());
+
+        // A page claiming an illegal site is skipped, not admitted.
+        let evil = Page {
+            metadata: Metadata {
+                schema: 1,
+                site: "EVIL".into(),
+                path: "home".into(),
+                title: "T".into(),
+                revision: 1,
+            },
+            components: vec![Component::Text { text: "x".into() }],
+            capabilities: vec![],
+        };
+        // Bypass from_json validation: serialize the struct directly.
+        let bytes = serde_json::to_vec(&evil).unwrap();
+        let eid = fs.put(&bytes).unwrap();
+        let pack = fs.export(&[eid]).unwrap();
+        let report = store.load_pack(&pack).unwrap();
+        assert_eq!((report.pages, report.chains, report.skipped), (0, 0, 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

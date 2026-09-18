@@ -15,6 +15,7 @@ fn usage() -> &'static str {
       nexus browse <site[/path]> [--server HOST:PORT] [--pin SITE_ID]\n\
       nexus sync --server HOST:PORT --site NAME --dir PATH [--pin SITE_ID]\n\
       nexus cache-gc [--dir PATH]\n\
+      nexus export --server HOST:PORT --site NAME --out FILE [--pin SITE_ID]\n\
       nexus history\n\
      \n\
      commands at the prompt:\n\
@@ -299,6 +300,63 @@ fn cmd_history() -> i32 {
     0
 }
 
+/// Pack a whole site into one NXPACK1 file (sneakernet export).
+/// Exit 0 + byte count on success, 1 on fetch/verify/write failure,
+/// 2 on bad arguments.
+fn cmd_export(args: &[String]) -> i32 {
+    let mut server = None;
+    let mut site = None;
+    let mut out = None;
+    let mut pin = None;
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "export" => {}
+            "--server" | "--site" | "--out" | "--pin" => {
+                let v = match it.next() {
+                    Some(v) => v.clone(),
+                    None => {
+                        eprintln!("usage: nexus export --server HOST:PORT --site NAME --out FILE [--pin SITE_ID]");
+                        return 2;
+                    }
+                };
+                match a.as_str() {
+                    "--server" => server = Some(v),
+                    "--site" => site = Some(v),
+                    "--out" => out = Some(v),
+                    _ => pin = Some(v),
+                }
+            }
+            s if s.starts_with('-') => {
+                eprintln!("unknown arg: {s}\nusage: nexus export --server HOST:PORT --site NAME --out FILE [--pin SITE_ID]");
+                return 2;
+            }
+            s => {
+                eprintln!("unexpected arg: {s}\nusage: nexus export --server HOST:PORT --site NAME --out FILE [--pin SITE_ID]");
+                return 2;
+            }
+        }
+    }
+    let (Some(server), Some(site), Some(out)) = (server, site, out) else {
+        eprintln!("usage: nexus export --server HOST:PORT --site NAME --out FILE [--pin SITE_ID]");
+        return 2;
+    };
+    match nexus_browser::export_site(&server, &site, pin.as_deref()) {
+        Ok(pack) => {
+            if let Err(e) = std::fs::write(&out, &pack) {
+                eprintln!("nexus export: write {out}: {e}");
+                return 1;
+            }
+            println!("exported {} byte(s) to {out}", pack.len());
+            0
+        }
+        Err(e) => {
+            eprintln!("nexus export: {e}");
+            1
+        }
+    }
+}
+
 fn render(session: &ClientSession) {
     if let Some(v) = session.history.current() {
         println!(
@@ -381,6 +439,9 @@ fn main() {
     }
     if args.first().is_some_and(|a| a == "cache-gc") {
         std::process::exit(cmd_cache_gc(&args));
+    }
+    if args.first().is_some_and(|a| a == "export") {
+        std::process::exit(cmd_export(&args));
     }
     if args.first().is_some_and(|a| a == "history") {
         std::process::exit(cmd_history());

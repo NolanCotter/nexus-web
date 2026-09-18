@@ -491,6 +491,68 @@ pub fn navigate_cached_verified(
     }
 }
 
+/// Mirror a whole site into one NXPACK1 pack (sneakernet export): LIST
+/// the paths, FETCH each page (plus RECORDS + verification when `pin` is
+/// set), and pack the verified bytes. Only verified-or-unpinned pages
+/// enter the pack: a pin mismatch aborts with an error and no pack.
+/// Pack layout is the storage NXPACK1 format; [`SiteStore::load_pack`]
+/// (server crate) imports it.
+pub fn export_site(endpoint: &str, site: &str, pin: Option<&str>) -> Result<Vec<u8>, BrowserError> {
+    let list_line = nexus_protocol::encode_list_request(&nexus_protocol::ListRequest {
+        site: site.to_string(),
+    })?;
+    let (code, body) = nexus_transport::fetch_raw(endpoint, &list_line)?;
+    if code != 200 {
+        return Err(BrowserError::Status(
+            code,
+            String::from_utf8_lossy(&body).into_owned(),
+        ));
+    }
+    let paths: Vec<String> = serde_json::from_slice(&body)
+        .map_err(|e| BrowserError::Content(format!("bad LIST body: {e}")))?;
+    // Stage through a temp CAS: blobs are hashed on the way into the pack.
+    let stage = std::env::temp_dir().join(format!(
+        "nexus-export-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&stage);
+    let store = nexus_storage::FsStore::new(&stage);
+    let mut ids = Vec::new();
+    let result = (|| {
+        for path in &paths {
+            if !nexus_protocol::is_valid_path(path) {
+                continue;
+            }
+            let page = match pin {
+                None => fetch_page(endpoint, site, path)?,
+                Some(p) => {
+                    let records = fetch_records(endpoint, site, path)?;
+                    if records.is_empty() {
+                        return Err(BrowserError::PinRecordsRequired(p.to_string()));
+                    }
+                    let page = fetch_page(endpoint, site, path)?;
+                    verify_pinned(&page, p, path, &records, now_unix())?;
+                    let chain = serde_json::to_vec(&records)
+                        .map_err(|e| BrowserError::Content(format!("bad records body: {e}")))?;
+                    ids.push(store.put(&chain).map_err(BrowserError::from)?);
+                    page
+                }
+            };
+            let bytes = page
+                .to_canonical_json()
+                .map_err(|e| BrowserError::Content(e.to_string()))?;
+            ids.push(store.put(&bytes).map_err(BrowserError::from)?);
+        }
+        store.export(&ids).map_err(BrowserError::from)
+    })();
+    let _ = std::fs::remove_dir_all(&stage);
+    result
+}
+
 /// Outcome of [`sync_site`]: how many pages landed on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncReport {

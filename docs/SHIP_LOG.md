@@ -50,6 +50,8 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #46 DHT spike: Kademlia sim + sybil measurements → NO-GO per gates (`experiment/dht-kademlia`, path is federated→gossip)
 - [x] #47 authoritative negative caching with TTL (failures/forgeries never cached)
 - [x] #48 offline cache inside interactive sessions (TUI + browse go stale/verified-stale)
+- [x] #49 sneakernet: NXPACK site export (`nexus export`) + server `--pack` import
+- [x] #48 offline cache inside interactive sessions (TUI + browse go stale/verified-stale)
 - Next: DHT past gates, WebVM execution.
 
 ## Notes (wave 2, 2026-09-17)

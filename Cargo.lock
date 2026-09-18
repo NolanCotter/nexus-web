@@ -521,6 +521,7 @@ dependencies = [
  "nexus-content",
  "nexus-identity",
  "nexus-protocol",
+ "nexus-storage",
  "nexus-transport",
  "serde_json",
  "thiserror",

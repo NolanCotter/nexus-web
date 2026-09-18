@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use nexus_server::{ServerConfig, SiteStore};
 
 fn usage() -> &'static str {
-    "usage: nexus-server [--port PORT] [--site NAME] [--dir PATH] [--max-connections N] [--key PATH] [--record-ttl SECS] [--resign-interval SECS]"
+    "usage: nexus-server [--port PORT] [--site NAME] [--dir PATH] [--max-connections N] [--key PATH] [--record-ttl SECS] [--resign-interval SECS] [--pack FILE]..."
 }
 
 fn now_unix() -> u64 {
@@ -23,6 +23,8 @@ fn main() {
     let mut record_ttl: u64 = 86400;
     // Re-sign cadence; None = default to ttl/2 once --key is given.
     let mut resign_interval: Option<u64> = None;
+    // Sneakernet packs to import at startup (repeatable flag).
+    let mut packs: Vec<PathBuf> = Vec::new();
 
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
@@ -67,6 +69,12 @@ fn main() {
                     std::process::exit(2);
                 })
             }
+            "--pack" => {
+                packs.push(PathBuf::from(args.next().unwrap_or_else(|| {
+                    eprintln!("{}", usage());
+                    std::process::exit(2);
+                })));
+            }
             "--resign-interval" => {
                 resign_interval =
                     Some(args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
@@ -86,6 +94,25 @@ fn main() {
     }
 
     let mut store = SiteStore::new();
+    for pack_path in &packs {
+        let bytes = std::fs::read(pack_path).unwrap_or_else(|e| {
+            eprintln!("read pack {}: {e}", pack_path.display());
+            std::process::exit(1);
+        });
+        match store.load_pack(&bytes) {
+            Ok(r) => eprintln!(
+                "loaded pack {}: {} page(s), {} chain(s), {} skipped",
+                pack_path.display(),
+                r.pages,
+                r.chains,
+                r.skipped
+            ),
+            Err(e) => {
+                eprintln!("load pack {}: {e}", pack_path.display());
+                std::process::exit(1);
+            }
+        }
+    }
     match store.load_dir(&site, &dir) {
         Ok(n) => eprintln!(
             "loaded {n} page(s) for site '{site}' from {}",

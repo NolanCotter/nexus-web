@@ -17,6 +17,7 @@ path = "src/lib.rs"
 nexus-protocol = { path = "../protocol" }
 nexus-transport = { path = "../transport" }
 nexus-content = { path = "../content" }
+nexus-storage = { path = "../storage" }
 nexus-identity = { path = "../identity" }
 serde_json = "1"
 thiserror = "1"
