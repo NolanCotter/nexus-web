@@ -22,13 +22,18 @@ pub const MAX_SITE_LEN: usize = 64;
 /// Max bytes of a content path.
 pub const MAX_PATH_LEN: usize = 256;
 
-/// A parsed `FETCH` request: which site, which path.
+/// A parsed `FETCH` request: which site, which path, and what the
+/// client already holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchRequest {
     /// Lowercase site name (see [`is_valid_site`]).
     pub site: String,
     /// Content path, no leading slash (see [`is_valid_path`]).
     pub path: String,
+    /// Optional content id the client already has (`If-None-Match`): when
+    /// it matches the current page, the server answers `304` with an empty
+    /// body instead of resending bytes. `None` fetches unconditionally.
+    pub if_id: Option<String>,
 }
 
 /// A parsed `RECORDS` request: which site's signed records, which path.
@@ -134,9 +139,31 @@ pub fn is_valid_path(s: &str) -> bool {
 }
 
 /// Encode a request to its wire line. Fails on invalid site/path so bad
-/// input is caught locally instead of sent to the server.
+/// input is caught locally instead of sent to the server. A present
+/// `if_id` must be a well-formed content id (`b3:<64 hex>`); anything else
+/// is a local error, never sent.
 pub fn encode_request(req: &FetchRequest) -> Result<String, ProtocolError> {
+    if let Some(id) = &req.if_id {
+        if !is_content_id(id) {
+            return Err(ProtocolError::Malformed(format!("bad if_id: {id}")));
+        }
+        encode_request_line("FETCH", &req.site, &req.path)?;
+        return Ok(format!("{VERSION} FETCH {} {} {id}\n", req.site, req.path));
+    }
     encode_request_line("FETCH", &req.site, &req.path)
+}
+
+/// A content id is `b3:` plus 64 lowercase hex chars (BLAKE3 digest).
+/// Single canonical definition for wire preconditions; storage reuses it.
+pub fn is_content_id(id: &str) -> bool {
+    let hex = match id.strip_prefix("b3:") {
+        Some(h) => h,
+        None => return false,
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// Encode a `RECORDS` request to its wire line. Same validation as FETCH,
@@ -173,12 +200,18 @@ fn encode_request_line(verb: &str, site: &str, path: &str) -> Result<String, Pro
 /// Parse one request line (untrusted input). Rejects wrong version/verb,
 /// invalid site/path, and trailing extra tokens with typed errors.
 pub fn parse_request(line: &str) -> Result<FetchRequest, ProtocolError> {
-    let (verb, site, path) = split_request_line(line)?;
+    let (verb, site, path, extra) = split_request_line(line)?;
     if verb != "FETCH" {
         return Err(ProtocolError::BadVerb(verb));
     }
     check_site_path(&site, &path, line)?;
-    Ok(FetchRequest { site, path })
+    // Optional precondition token: a bare content id, nothing else.
+    let if_id = match extra {
+        None => None,
+        Some(id) if is_content_id(&id) => Some(id),
+        Some(_) => return Err(ProtocolError::Malformed(line.to_string())),
+    };
+    Ok(FetchRequest { site, path, if_id })
 }
 
 /// Parse one `RECORDS` request line (untrusted input). Same rules as
@@ -187,9 +220,12 @@ pub fn parse_request(line: &str) -> Result<FetchRequest, ProtocolError> {
 /// path and never reaches content stores — the server dispatches it to
 /// the endpoint plane before any page lookup.
 pub fn parse_records_request(line: &str) -> Result<RecordsRequest, ProtocolError> {
-    let (verb, site, path) = split_request_line(line)?;
+    let (verb, site, path, extra) = split_request_line(line)?;
     if verb != "RECORDS" {
         return Err(ProtocolError::BadVerb(verb));
+    }
+    if extra.is_some() {
+        return Err(ProtocolError::Malformed(line.to_string()));
     }
     if let Some(name) = path.strip_prefix('@') {
         if name.is_empty() || name != site.as_str() || !is_valid_site(&site) {
@@ -233,7 +269,9 @@ pub fn parse_list_request(line: &str) -> Result<ListRequest, ProtocolError> {
     })
 }
 
-fn split_request_line(line: &str) -> Result<(String, String, String), ProtocolError> {
+fn split_request_line(
+    line: &str,
+) -> Result<(String, String, String, Option<String>), ProtocolError> {
     let line = line.strip_suffix('\n').unwrap_or(line);
     let line = line.strip_suffix('\r').unwrap_or(line);
     if line.is_empty() {
@@ -242,15 +280,16 @@ fn split_request_line(line: &str) -> Result<(String, String, String), ProtocolEr
     if line.len() > MAX_LINE {
         return Err(ProtocolError::LineTooLong);
     }
-    let mut parts = line.splitn(4, ' ');
+    let mut parts = line.splitn(5, ' ');
     let version = parts.next().unwrap_or("");
     let verb = parts.next().unwrap_or("");
     let site = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
+    let extra = parts.next().map(str::to_string);
     if version != VERSION {
         return Err(ProtocolError::BadVersion(version.to_string()));
     }
-    Ok((verb.to_string(), site.to_string(), path.to_string()))
+    Ok((verb.to_string(), site.to_string(), path.to_string(), extra))
 }
 
 /// Shared site/path validation plus trailing-token rejection for the
@@ -352,6 +391,7 @@ mod tests {
         let req = FetchRequest {
             site: "example".into(),
             path: "home".into(),
+            if_id: None,
         };
         let line = encode_request(&req).unwrap();
         assert_eq!(line, "NXP/0.1 FETCH example home\n");
@@ -458,6 +498,44 @@ mod tests {
     }
 
     #[test]
+    fn if_id_roundtrip() {
+        let id = format!("b3:{}", "ab".repeat(32));
+        let req = FetchRequest {
+            site: "example".into(),
+            path: "home".into(),
+            if_id: Some(id.clone()),
+        };
+        let line = encode_request(&req).unwrap();
+        assert_eq!(line, format!("NXP/0.1 FETCH example home {id}\n"));
+        assert_eq!(parse_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn if_id_rejects_garbage() {
+        // Bad ids fail locally (encode) and on the wire (parse).
+        let bad = FetchRequest {
+            site: "example".into(),
+            path: "home".into(),
+            if_id: Some("nope".into()),
+        };
+        assert!(encode_request(&bad).is_err());
+        assert!(matches!(
+            parse_request("NXP/0.1 FETCH example home nope\n"),
+            Err(ProtocolError::Malformed(_))
+        ));
+        assert!(matches!(
+            parse_request("NXP/0.1 FETCH example home b3:ab EXTRA\n"),
+            Err(ProtocolError::Malformed(_))
+        ));
+        // RECORDS takes no precondition, even a well-formed id.
+        let id = format!("b3:{}", "ab".repeat(32));
+        assert!(matches!(
+            parse_records_request(&format!("NXP/0.1 RECORDS example home {id}\n")),
+            Err(ProtocolError::Malformed(_))
+        ));
+    }
+
+    #[test]
     fn records_rejects_bad_site_and_path() {
         assert!(matches!(
             parse_records_request("NXP/0.1 RECORDS Example home\n"),
@@ -479,6 +557,7 @@ mod tests {
         let req = FetchRequest {
             site: "nolan".into(),
             path: "blog/hello-world".into(),
+            if_id: None,
         };
         let line = encode_request(&req).unwrap();
         assert_eq!(parse_request(&line).unwrap(), req);
@@ -530,6 +609,7 @@ mod tests {
         let bad = FetchRequest {
             site: "a\nINJECT".into(),
             path: "home".into(),
+            if_id: None,
         };
         assert!(encode_request(&bad).is_err());
     }

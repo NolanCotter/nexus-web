@@ -311,6 +311,7 @@ pub fn fetch_page(endpoint: &str, site: &str, path: &str) -> Result<Page, Browse
     let req = nexus_protocol::FetchRequest {
         site: site.to_string(),
         path: path.to_string(),
+        if_id: None,
     };
     // Validate before sending so errors are local, not network roundtrips.
     nexus_protocol::encode_request(&req)?;

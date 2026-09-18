@@ -223,6 +223,7 @@ fn node_a_to_node_b_serves_page() {
     let req = nexus_protocol::FetchRequest {
         site: "example".into(),
         path: "home".into(),
+        if_id: None,
     };
     let (code, got) = nexus_transport::fetch(addr, &req).unwrap();
     assert_eq!(code, 200);

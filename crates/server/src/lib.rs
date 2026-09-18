@@ -386,6 +386,13 @@ fn endpoint_name(site: &str, path: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Content id of served `body`, or `None` when the bytes do not parse
+/// (corrupt store entries never match a precondition — the client gets a
+/// normal 200 and revalidates the bytes itself).
+fn page_content_id(body: &[u8]) -> Option<String> {
+    nexus_content::Page::from_json(body).ok()?.content_id().ok()
+}
+
 /// Handle one connection: read request line, write one response, close.
 ///
 /// The caller is responsible for read/write deadlines on `stream`
@@ -398,7 +405,14 @@ pub fn handle_one(stream: &std::net::TcpStream, store: &SiteStore) -> Result<(),
     // Anything else (including malformed lines) is a 400 — never a panic.
     let response = match nxp::parse_request(&line) {
         Ok(req) => match store.get(&req.site, &req.path) {
-            Some(body) => nxp::encode_response(200, body)?,
+            Some(body) => match &req.if_id {
+                // Precondition hit: the client already holds these exact
+                // bytes — confirm with an empty 304, not a resend.
+                Some(id) if page_content_id(body).as_ref() == Some(id) => {
+                    nxp::encode_response(304, b"")?
+                }
+                _ => nxp::encode_response(200, body)?,
+            },
             None => nxp::encode_response(404, b"not found")?,
         },
         Err(nxp::ProtocolError::BadVerb(_)) => match nxp::parse_records_request(&line) {
@@ -586,6 +600,7 @@ mod tests {
         let req = nxp::FetchRequest {
             site: "example".into(),
             path: "home".into(),
+            if_id: None,
         };
         let (code, body) = nexus_transport::fetch(addr, &req).unwrap();
         assert_eq!(code, 200);
@@ -605,6 +620,7 @@ mod tests {
         let req = nxp::FetchRequest {
             site: "example".into(),
             path: "nope".into(),
+            if_id: None,
         };
         let (code, _) = nexus_transport::fetch(addr, &req).unwrap();
         assert_eq!(code, 404);
@@ -982,5 +998,52 @@ mod tests {
         let report = store.load_pack(&pack).unwrap();
         assert_eq!((report.pages, report.chains, report.skipped), (0, 0, 1));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_precondition_304_when_unchanged() {
+        let mut store = SiteStore::new();
+        store.insert("example", "home", page_bytes("example", "home"));
+        let id = nexus_content::Page::from_json(store.get("example", "home").unwrap())
+            .unwrap()
+            .content_id()
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().unwrap();
+                handle_one(&stream, &store).unwrap();
+            }
+        });
+        // Matching id: 304 with an empty body.
+        let req = nxp::FetchRequest {
+            site: "example".into(),
+            path: "home".into(),
+            if_id: Some(id),
+        };
+        let line = nxp::encode_request(&req).unwrap();
+        let (code, body) = nexus_transport::fetch_raw(addr, &line).unwrap();
+        assert_eq!(code, 304);
+        assert!(body.is_empty());
+        // Stale id: full 200.
+        let stale = nxp::FetchRequest {
+            site: "example".into(),
+            path: "home".into(),
+            if_id: Some(format!("b3:{}", "00".repeat(32))),
+        };
+        let line = nxp::encode_request(&stale).unwrap();
+        let (code, body) = nexus_transport::fetch_raw(addr, &line).unwrap();
+        assert_eq!(code, 200);
+        assert!(!body.is_empty());
+        // No precondition: full 200 (backwards compatible).
+        let plain = nxp::FetchRequest {
+            site: "example".into(),
+            path: "home".into(),
+            if_id: None,
+        };
+        let line = nxp::encode_request(&plain).unwrap();
+        let (code, _) = nexus_transport::fetch_raw(addr, &line).unwrap();
+        assert_eq!(code, 200);
     }
 }

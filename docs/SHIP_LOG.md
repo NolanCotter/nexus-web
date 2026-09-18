@@ -51,6 +51,7 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #47 authoritative negative caching with TTL (failures/forgeries never cached)
 - [x] #48 offline cache inside interactive sessions (TUI + browse go stale/verified-stale)
 - [x] #49 sneakernet: NXPACK site export (`nexus export`) + server `--pack` import
+- [x] #50 conditional FETCH: content-id preconditions + 304, cache revalidation
 - Next: DHT past gates, WebVM execution.
 
 ## Notes (wave 2, 2026-09-17)

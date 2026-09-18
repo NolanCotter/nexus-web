@@ -132,25 +132,62 @@ impl OfflineCache {
         PathBuf::from(home).join(".cache").join("nexus")
     }
 
-    /// Fetch `(site, path)` from `endpoint`, persisting on success. On
-    /// transport failure only, serve the cached revision as `Stale`; other
-    /// errors (404, malformed response) are never shadowed.
+    /// Content id currently cached for (site, path), if any (index read
+    /// only — no blob verification; the 304 path revalidates fully).
+    pub fn cached_id(&self, site: &str, path: &str) -> Option<String> {
+        if !valid_key(site, path) {
+            return None;
+        }
+        self.read_index()
+            .ok()?
+            .pages
+            .get(&key(site, path))
+            .map(|e| e.content_id.clone())
+    }
+
+    /// Fetch `(site, path)` from `endpoint`, persisting on success. Sends
+    /// the cached content id as a precondition when present: an unchanged
+    /// page comes back `304` with no body and is served from cache as
+    /// `Fresh` (revalidated, not stale). On transport failure only, serve
+    /// the cached revision as `Stale`; other errors (404, malformed
+    /// response) are never shadowed.
     pub fn fetch(
         &self,
         endpoint: &str,
         site: &str,
         path: &str,
     ) -> Result<(Page, CacheStatus), BrowserError> {
-        match crate::fetch_page(endpoint, site, path) {
-            Ok(page) => {
+        let req = nexus_protocol::FetchRequest {
+            site: site.to_string(),
+            path: path.to_string(),
+            if_id: self.cached_id(site, path),
+        };
+        // Validate before sending so errors are local, not network roundtrips.
+        nexus_protocol::encode_request(&req)?;
+        match nexus_transport::fetch(endpoint, &req) {
+            Ok((200, body)) => {
+                let page = nexus_content::Page::from_json(&body)
+                    .map_err(|e| BrowserError::Content(e.to_string()))?;
                 let _ = self.put(site, path, &page);
                 Ok((page, CacheStatus::Fresh))
             }
-            Err(e @ BrowserError::Transport(nexus_transport::TransportError::Io(_))) => self
+            Ok((304, _)) => match self.lookup(site, path) {
+                // Confirmed current by the server; corrupt local copy falls
+                // back to one unconditional fetch rather than failing.
+                Some(page) => Ok((page, CacheStatus::Fresh)),
+                None => Ok((crate::fetch_page(endpoint, site, path)?, CacheStatus::Fresh)),
+            },
+            Ok((code, body)) => Err(BrowserError::Status(
+                code,
+                String::from_utf8_lossy(&body).into_owned(),
+            )),
+            Err(nexus_transport::TransportError::Io(inner)) => self
                 .lookup(site, path)
                 .map(|p| (p, CacheStatus::Stale))
-                .ok_or(e),
-            Err(e) => Err(e),
+                .ok_or(BrowserError::Transport(
+                    nexus_transport::TransportError::Io(inner),
+                )),
+            Err(e) => Err(e.into()),
         }
     }
 

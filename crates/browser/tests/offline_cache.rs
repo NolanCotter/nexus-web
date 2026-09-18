@@ -214,3 +214,42 @@ fn fresh_server_revision_replaces_cached_copy() {
     assert_eq!(page2.metadata.revision, 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn second_fetch_sends_precondition_and_takes_304() {
+    use std::io::{BufRead, Write};
+    use std::sync::{Arc, Mutex};
+    let dir = temp_dir("revalidate");
+    let cache = OfflineCache::new(&dir);
+
+    // Prime the cache with a real fetch.
+    let (addr, server) = serve_once(page_bytes(1));
+    let (page, _) = cache.fetch(&addr.to_string(), "example", "home").unwrap();
+    let want = page.content_id().unwrap();
+    server.join().unwrap();
+
+    // Spy server: capture the request line, answer 304 with empty body.
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = Arc::clone(&seen);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr2 = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut r = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        seen2.lock().unwrap().push(line);
+        let frame = nexus_protocol::encode_response(304, b"").unwrap();
+        stream.try_clone().unwrap().write_all(&frame).unwrap();
+    });
+    let (page2, status) = cache.fetch(&addr2.to_string(), "example", "home").unwrap();
+    assert!(matches!(status, CacheStatus::Fresh));
+    assert_eq!(page2.content_id().unwrap(), want);
+    handle.join().unwrap();
+
+    // The client actually sent what it holds — bandwidth saved server-side.
+    let lines = seen.lock().unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0], format!("NXP/0.1 FETCH example home {want}\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

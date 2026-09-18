@@ -5,7 +5,7 @@ Transport: TCP. One request line, one response frame, connection closes.
 ## Request
 
 ```text
-NXP/0.1 FETCH <site> <path>\n
+NXP/0.1 FETCH <site> <path>[ <if_id>]\n
 NXP/0.1 RECORDS <site> <path>\n
 NXP/0.1 LIST <site>\n
 ```
@@ -13,7 +13,10 @@ NXP/0.1 LIST <site>\n
 - `site`: `[a-z0-9-]{1,64}`, no leading/trailing `-`.
 - `path`: `[A-Za-z0-9/_.\-+]{1,256}`, no `..`, no `//`, no leading `/`. Example: `home`, `blog/hello`.
 - Line max 4096 bytes incl. `\n`. Anything else -> server replies `400`.
-- `FETCH` returns the page body. `RECORDS` returns a JSON array of
+- `FETCH` returns the page body, or `304` with an empty body when the
+  optional `if_id` precondition (`b3:<64 hex>`, the content id the client
+  already holds) matches the current page. Bad preconditions are `400`.
+- `RECORDS` returns a JSON array of
   `SignedRecord` vouching for the page. `LIST` returns a JSON array of the
   site's paths. `404` means not found / no records (e.g. a server started
   without `--key` has no chains) / unknown site. Unknown verbs -> `400`.
