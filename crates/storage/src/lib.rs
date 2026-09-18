@@ -469,6 +469,26 @@ impl FsStore {
     /// truncated file, an overlarge blob, or trailing garbage all reject the
     /// entire pack and leave the store untouched. Bytes are never `unwrap`ed.
     pub fn import(&self, pack: &[u8]) -> Result<ImportReport, StoreError> {
+        let blobs = Self::unpack(pack)?;
+        let mut total_bytes = 0usize;
+        // Verification completed inside `unpack`; only now touch the store.
+        for (_, bytes) in &blobs {
+            self.put(bytes)?; // idempotent; content hashes to the verified id
+            total_bytes = total_bytes
+                .checked_add(bytes.len())
+                .ok_or_else(|| StoreError::Corrupt("total overflow".into()))?;
+        }
+        Ok(ImportReport {
+            blobs: blobs.len(),
+            total_bytes,
+        })
+    }
+
+    /// Decode an NXPACK1 file into `(content_id, bytes)` pairs without
+    /// storing anything. Same verification as [`FsStore::import`]: bad
+    /// magic, truncation, overlarge blobs, hash mismatch, and trailing
+    /// garbage all fail before any byte is trusted.
+    pub fn unpack(pack: &[u8]) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
         if pack.len() > MAX_PACK {
             return Err(StoreError::TooLarge(pack.len()));
         }
@@ -508,14 +528,7 @@ impl FsStore {
                 pack.len() - pos
             )));
         }
-        // Verification completed above; only now touch the store.
-        for (_, bytes) in &blobs {
-            self.put(bytes)?; // idempotent; content hashes to the verified id
-        }
-        Ok(ImportReport {
-            blobs: blobs.len(),
-            total_bytes,
-        })
+        Ok(blobs)
     }
 }
 
