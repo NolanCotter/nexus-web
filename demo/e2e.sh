@@ -8,7 +8,10 @@
 # The script starts nexus-server on a free loopback port, fetches the
 # `home` and `about` pages with nexus-browser (both must succeed and
 # render expected text), then fetches a missing page (must fail with a
-# 404), and finally stops the server. Any unexpected result exits nonzero.
+# 404). It then restarts the server with a fresh site key and checks the
+# signed flow: verified fetch with the right pin, refusal with the wrong
+# pin, and a full `nexus sync` mirror. Finally it stops the server. Any
+# unexpected result exits nonzero.
 
 set -u
 
@@ -18,6 +21,7 @@ cd "$ROOT"
 
 SERVER_BIN="./target/debug/nexus-server"
 BROWSER_BIN="./target/debug/nexus-browser"
+NEXUS_BIN="./target/debug/nexus"
 SITE_DIR="sites/example"
 SITE="example"
 
@@ -34,6 +38,7 @@ pass() {
 command -v python3 >/dev/null 2>&1 || fail "python3 is required (free-port selection)"
 [[ -x "$SERVER_BIN" ]] || fail "missing $SERVER_BIN (run: cargo build -p nexus-server -p nexus-browser)"
 [[ -x "$BROWSER_BIN" ]] || fail "missing $BROWSER_BIN (run: cargo build -p nexus-server -p nexus-browser)"
+[[ -x "$NEXUS_BIN" ]] || fail "missing $NEXUS_BIN (run: cargo build -p nexus-server -p nexus-browser)"
 [[ -d "$SITE_DIR" ]] || fail "missing $SITE_DIR (run from the repo root)"
 
 # --- free port -------------------------------------------------------------
@@ -88,3 +93,50 @@ rm -f "$MISSING_ERR"
 pass "$SITE/does-not-exist fails with 404 as expected"
 
 echo "e2e: PASS: home + about render, missing page 404s"
+
+# --- signed flow ---------------------------------------------------------
+# Restart with a fresh site key; the unsigned server above stays down via
+# cleanup ordering (kill first so the port is free to reuse).
+kill "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+KEY_FILE="$(mktemp -t nexus-e2e-key.XXXXXX)"
+rm -f "$KEY_FILE"
+"$SERVER_BIN" --port "$PORT" --site "$SITE" --dir "$SITE_DIR" --key "$KEY_FILE" 2>"$SERVER_LOG" &
+SERVER_PID=$!
+
+READY=0
+for _ in $(seq 1 50); do
+    if "$BROWSER_BIN" --server "$ENDPOINT" --site "$SITE" --path home >/dev/null 2>&1; then
+        READY=1
+        break
+    fi
+    sleep 0.1
+done
+[[ "$READY" -eq 1 ]] || { cat "$SERVER_LOG" >&2; fail "signed server did not become ready"; }
+SITE_ID="$(grep -a -o -m1 "site identity: [0-9a-f]*" "$SERVER_LOG" | awk '{print $3}')"
+[[ "$SITE_ID" =~ ^[0-9a-f]{64}$ ]] || { cat "$SERVER_LOG" >&2; fail "could not read site identity"; }
+pass "signed server up, site identity $SITE_ID"
+rm -f "$KEY_FILE"
+
+# Verified fetch with the right pin renders.
+PINNED_OUT="$("$BROWSER_BIN" --server "$ENDPOINT" --site "$SITE" --path home --pin "$SITE_ID" 2>/dev/null)" \
+    || fail "verified fetch exited $?"
+[[ "$PINNED_OUT" == *"Hello, Nexus"* ]] || fail "verified fetch did not render"
+pass "verified fetch with correct pin renders"
+
+# Wrong pin fails closed (nonzero exit).
+if "$BROWSER_BIN" --server "$ENDPOINT" --site "$SITE" --path home --pin "0000000000000000000000000000000000000000000000000000000000000000" >/dev/null 2>&1; then
+    fail "verified fetch with wrong pin unexpectedly succeeded"
+fi
+pass "verified fetch with wrong pin refused"
+
+# Full verified mirror via `nexus sync`.
+SYNC_DIR="$(mktemp -d -t nexus-e2e-sync.XXXXXX)"
+"$NEXUS_BIN" sync --server "$ENDPOINT" --site "$SITE" --dir "$SYNC_DIR" --pin "$SITE_ID" >/dev/null 2>&1 \
+    || fail "nexus sync exited $?"
+[[ -f "$SYNC_DIR/home.json" ]] || fail "sync did not write home.json"
+[[ -f "$SYNC_DIR/about.json" ]] || fail "sync did not write about.json"
+rm -rf "$SYNC_DIR"
+pass "verified nexus sync mirrors the site"
+
+echo "e2e: PASS: full suite incl. signed flow and sync"
