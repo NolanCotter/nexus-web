@@ -41,10 +41,11 @@
 
 ## Gaps (explicit)
 
-1. **Server does not serve signed records yet.** The browser API takes
-   records explicitly rather than faking a wire fetch; the server/protocol
-   lane must add a records endpoint, and the browser should then fetch
-   records from the same host before trusting content.
+1. **Server-side record serving: DONE (2026-09-18).** `SiteStore::sign_pages`
+   publishes one `SignedRecord` per route at startup (`--key`); `RECORDS`
+   serves the chain and `navigate_verified` fetches + verifies it from the
+   same host. Remaining: record refresh without restart, multi-record chains
+   per path (rotation history).
 2. **Warm-path cache bypass.** `CachingResolver` serves the petname table
    without re-consulting backends; revocation via a backend takes effect on
    the next cold resolve, and `revoke_record` invalidates the table
