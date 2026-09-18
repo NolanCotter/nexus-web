@@ -394,7 +394,9 @@ fn main() {
         std::process::exit(2);
     };
 
-    let mut session = ClientSession::new(server).with_pin(pin);
+    let mut session = ClientSession::new(server)
+        .with_pin(pin)
+        .with_cache(nexus_browser::OfflineCache::open_default());
     if let Err(e) = session.open(&target) {
         eprintln!("nexus: {target}: {e}");
         std::process::exit(1);

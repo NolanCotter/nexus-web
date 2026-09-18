@@ -125,11 +125,27 @@ impl TuiState {
         }
     }
 
-    /// Human-readable location line for the status bar.
+    /// Attach the offline page cache: fetches fall back to cached
+    /// revisions (verified ones when pinned) with no network.
+    pub fn with_cache(mut self, cache: crate::OfflineCache) -> Self {
+        // Move the live session out, apply the builder, move it back; the
+        // placeholder never serves a fetch.
+        let session = std::mem::replace(&mut self.session, ClientSession::new(String::new()));
+        self.session = session.with_cache(cache);
+        self
+    }
+
+    /// Human-readable location line for the status bar, with an offline
+    /// marker when the current page came from cache.
     pub fn where_am_i(&self) -> String {
-        match self.session.history.current() {
+        let base = match self.session.history.current() {
             Some(v) => format!("@{} /{} — {}", v.site, v.path, v.page.metadata.title),
             None => String::from("(no page loaded)"),
+        };
+        match self.session.last_status() {
+            Some(crate::CacheStatus::Stale) => format!("{base} [offline]"),
+            Some(crate::CacheStatus::StaleVerified) => format!("{base} [offline, verified]"),
+            _ => base,
         }
     }
 

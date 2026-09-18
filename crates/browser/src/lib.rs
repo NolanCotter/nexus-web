@@ -184,6 +184,8 @@ pub struct ClientSession {
     resolver: LocalResolver,
     server: String,
     pin: Option<String>,
+    cache: Option<OfflineCache>,
+    last_status: Option<CacheStatus>,
     pub history: History,
 }
 
@@ -193,8 +195,24 @@ impl ClientSession {
             resolver: LocalResolver::new(),
             server: server.into(),
             pin: None,
+            cache: None,
+            last_status: None,
             history: History::new(),
         }
+    }
+
+    /// Serve fetches through `cache` (offline fallback) when present.
+    /// Without a cache the session fetches from the network only.
+    pub fn with_cache(mut self, cache: OfflineCache) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// How the current page was obtained, if anything was fetched yet.
+    /// Interactive shells (and the TUI status line) use this to show
+    /// offline banners.
+    pub fn last_status(&self) -> Option<CacheStatus> {
+        self.last_status
     }
 
     /// Pin all lazily-created routes to `site_id`: every fetch then goes
@@ -231,15 +249,18 @@ impl ClientSession {
             .endpoints
             .first()
             .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
-        let Some(pinned) = route.pinned_site_id.clone() else {
-            return fetch_page(endpoint, site, path);
-        };
-        let records = fetch_records(endpoint, site, path)?;
-        if records.is_empty() {
-            return Err(BrowserError::PinRecordsRequired(pinned));
-        }
-        let page = fetch_page(endpoint, site, path)?;
-        verify_pinned(&page, &pinned, path, &records, now_unix())?;
+        let (page, status) = match (&self.cache, route.pinned_site_id.clone()) {
+            // Pinned + cached: verified fetch with verified-stale fallback.
+            // A verified refusal (no chain) is returned as-is even when the
+            // plain cache holds the page: unpinned bytes never satisfy a pin.
+            (Some(cache), Some(pinned)) => cache.fetch_verified(endpoint, site, path, &pinned),
+            (Some(cache), None) => cache.fetch(endpoint, site, path),
+            (None, Some(_)) => {
+                navigate_verified(&self.resolver, site, path).map(|page| (page, CacheStatus::Fresh))
+            }
+            (None, None) => fetch_page(endpoint, site, path).map(|page| (page, CacheStatus::Fresh)),
+        }?;
+        self.last_status = Some(status);
         Ok(page)
     }
 
@@ -683,6 +704,65 @@ mod tests {
             Err(BrowserError::PinMismatch { .. })
         ));
         assert!(bad.history.current().is_none());
+    }
+
+    fn session_cache_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nexus-session-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn session_with_cache_serves_stale_offline() {
+        use std::net::TcpListener;
+        let dir = session_cache_dir("stale");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        // One-shot server: answers a single FETCH, then the port dies.
+        let page = test_page("example", "home");
+        std::thread::spawn(move || {
+            let mut store = nexus_server::SiteStore::new();
+            store.insert("example", "home", page);
+            let (stream, _) = listener.accept().unwrap();
+            nexus_server::handle_one(&stream, &store).unwrap();
+        });
+        let mut session = ClientSession::new(addr.clone()).with_cache(OfflineCache::new(&dir));
+        session.open("example/home").unwrap();
+        assert_eq!(session.last_status(), Some(CacheStatus::Fresh));
+        // Port is dead now: the session serves the cached revision.
+        session.open("example/home").unwrap();
+        assert_eq!(session.last_status(), Some(CacheStatus::Stale));
+        assert_eq!(session.history.current().unwrap().page.metadata.title, "T");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_with_cache_serves_verified_stale_offline() {
+        use std::net::TcpListener;
+        let dir = session_cache_dir("verified");
+        let id = nexus_identity::SiteIdentity::from_secret_bytes(&[27u8; 32]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        // Two-shot server: RECORDS + FETCH, then dies.
+        let page = test_page("example", "home");
+        let server_id = id.clone();
+        std::thread::spawn(move || {
+            let mut store = nexus_server::SiteStore::new();
+            store.insert("example", "home", page);
+            store.sign_pages(&server_id, 9_999_999_999).unwrap();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                nexus_server::handle_one(&stream, &store).unwrap();
+            }
+        });
+        let mut session = ClientSession::new(addr.clone())
+            .with_pin(Some(id.site_id()))
+            .with_cache(OfflineCache::new(&dir));
+        session.open("example/home").unwrap();
+        assert_eq!(session.last_status(), Some(CacheStatus::Fresh));
+        session.open("example/home").unwrap();
+        assert_eq!(session.last_status(), Some(CacheStatus::StaleVerified));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

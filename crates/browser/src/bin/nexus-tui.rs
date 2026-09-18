@@ -197,7 +197,8 @@ fn run(server: String, pin: Option<String>, target: Option<String>) -> io::Resul
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut state = TuiState::new(server, pin);
+    let mut state =
+        TuiState::new(server, pin).with_cache(nexus_browser::OfflineCache::open_default());
     state.load_history();
     if let Some(t) = target {
         state.open(&t);
