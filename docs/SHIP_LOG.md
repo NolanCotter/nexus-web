@@ -45,6 +45,7 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #41 cache GC: orphan/tmp reaping + `nexus cache-gc` (foreign files untouched)
 - [x] #42 TUI polish: history persistence, find-in-page, help overlay
 - [x] #43 cross-session `nexus history` shared with the TUI log
+- [x] #44 federated resolver backend over RECORDS (DHT gate 2 dogfood, ADR 010)
 - Next: DHT past gates, WebVM execution.
 
 ## Notes (wave 2, 2026-09-17)
