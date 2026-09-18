@@ -37,7 +37,8 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #33 security batteries: 237-input parser totality, traversal, 64-byte sig flips, resolver/store behavior (168 green)
 - [x] #34 RECORDS verb + server record signing (--key) + wire-verified browser fetch (--pin); M3 gap 1 closed
 - [x] #35 verified sessions: ClientSession pinning + `nexus browse --pin` interactive verified nav
-- Next: TUI browser, record refresh without restart, DHT past gates.
+- [x] #36 background record refresh: re-signer thread + --resign-interval, no restart
+- Next: TUI browser, DHT past gates.
 
 ## Notes (wave 2, 2026-09-17)
 - `cargo test --workspace`: 141+ passed, 0 failed. `cargo fmt --check`: clean.

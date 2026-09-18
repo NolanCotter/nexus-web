@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use nexus_server::{ServerConfig, SiteStore};
 
 fn usage() -> &'static str {
-    "usage: nexus-server [--port PORT] [--site NAME] [--dir PATH] [--max-connections N] [--key PATH] [--record-ttl SECS]"
+    "usage: nexus-server [--port PORT] [--site NAME] [--dir PATH] [--max-connections N] [--key PATH] [--record-ttl SECS] [--resign-interval SECS]"
 }
 
 fn now_unix() -> u64 {
@@ -21,6 +21,8 @@ fn main() {
     let mut config = ServerConfig::default();
     let mut key_path: Option<PathBuf> = None;
     let mut record_ttl: u64 = 86400;
+    // Re-sign cadence; None = default to ttl/2 once --key is given.
+    let mut resign_interval: Option<u64> = None;
 
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
@@ -64,6 +66,13 @@ fn main() {
                     eprintln!("{}", usage());
                     std::process::exit(2);
                 })
+            }
+            "--resign-interval" => {
+                resign_interval =
+                    Some(args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                        eprintln!("{}", usage());
+                        std::process::exit(2);
+                    }))
             }
             "--help" | "-h" => {
                 println!("{}", usage());
@@ -115,6 +124,14 @@ fn main() {
                 eprintln!("sign pages: {e}");
                 std::process::exit(1);
             }
+        }
+        // Background refresh (default ttl/2, --resign-interval overrides,
+        // 0 disables) so records never expire on a long-lived server.
+        let interval = resign_interval.unwrap_or(record_ttl / 2);
+        if interval > 0 {
+            store.set_signer(identity, record_ttl);
+            config.resign_interval = Some(std::time::Duration::from_secs(interval.max(1)));
+            eprintln!("record refresh every {}s", interval.max(1));
         }
     }
 

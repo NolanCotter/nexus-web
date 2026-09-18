@@ -40,6 +40,14 @@ pub enum ServerError {
 pub struct SiteStore {
     pages: HashMap<(String, String), Vec<u8>>,
     records: HashMap<(String, String), Vec<u8>>,
+    signer: Option<SignerState>,
+}
+
+/// Identity + TTL used to (re-)sign pages into `RECORDS`.
+#[derive(Debug, Clone)]
+struct SignerState {
+    identity: nexus_identity::SiteIdentity,
+    ttl_secs: u64,
 }
 
 impl SiteStore {
@@ -67,6 +75,14 @@ impl SiteStore {
         self.records
             .get(&(site.to_string(), path.to_string()))
             .map(Vec::as_slice)
+    }
+
+    /// Install the identity + TTL used for background re-signing. The next
+    /// [`SiteStore::sign_pages`] call (manual or via the re-signer thread in
+    /// [`serve_with_config`]) publishes fresh records; pages themselves are
+    /// untouched.
+    pub fn set_signer(&mut self, identity: nexus_identity::SiteIdentity, ttl_secs: u64) {
+        self.signer = Some(SignerState { identity, ttl_secs });
     }
 
     /// Sign every stored page with `identity` and publish one
@@ -155,6 +171,11 @@ pub struct ServerConfig {
     pub read_timeout: Duration,
     /// Per-connection write deadline.
     pub write_timeout: Duration,
+    /// When `Some`, a background thread re-signs all pages into `RECORDS`
+    /// on this cadence (only if the store has a signer; see
+    /// [`SiteStore::set_signer`]). `None` (default) serves the startup
+    /// records until they expire.
+    pub resign_interval: Option<Duration>,
 }
 
 impl Default for ServerConfig {
@@ -163,6 +184,7 @@ impl Default for ServerConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             read_timeout: DEFAULT_READ_TIMEOUT,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
+            resign_interval: None,
         }
     }
 }
@@ -239,6 +261,11 @@ pub fn serve_with_config(
     config: ServerConfig,
 ) -> Result<(), ServerError> {
     let active = Arc::new(AtomicUsize::new(0));
+    let shared = Arc::new(std::sync::RwLock::new(store));
+    if let Some(interval) = config.resign_interval {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || resign_loop(shared, interval));
+    }
     for stream in listener.incoming() {
         let stream = stream?;
         if !try_acquire(&active, config.max_connections) {
@@ -252,18 +279,53 @@ pub fn serve_with_config(
             }
             continue;
         }
-        let store = store.clone();
+        // Snapshot under a read lock so the re-signer can publish fresh
+        // records concurrently; each connection serves a consistent view.
+        let snapshot = read_store(&shared).clone();
         let active = Arc::clone(&active);
         std::thread::spawn(move || {
             let _guard = InFlight { active };
             let _ = stream.set_read_timeout(Some(config.read_timeout));
             let _ = stream.set_write_timeout(Some(config.write_timeout));
-            if let Err(e) = handle_one(&stream, &store) {
+            if let Err(e) = handle_one(&stream, &snapshot) {
                 eprintln!("connection error: {e}");
             }
         });
     }
     Ok(())
+}
+
+/// Read-lock the shared store, recovering from poisoning instead of
+/// panicking the accept loop.
+fn read_store(
+    shared: &Arc<std::sync::RwLock<SiteStore>>,
+) -> std::sync::RwLockReadGuard<'_, SiteStore> {
+    shared
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Background record refresh: re-sign every page into `RECORDS` on each
+/// tick so long-lived servers never serve expired chains. Skips ticks when
+/// no signer is installed (pages-only mode). Failures are logged, never
+/// fatal: the previous records stay live until replaced.
+fn resign_loop(shared: Arc<std::sync::RwLock<SiteStore>>, interval: Duration) {
+    loop {
+        std::thread::sleep(interval);
+        let (identity, ttl) = match read_store(&shared).signer.clone() {
+            Some(s) => (s.identity, s.ttl_secs),
+            None => continue,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut store = shared.write().unwrap_or_else(|p| p.into_inner());
+        match store.sign_pages(&identity, now.saturating_add(ttl)) {
+            Ok(n) => eprintln!("resigned {n} record(s)"),
+            Err(e) => eprintln!("resign failed (keeping old records): {e}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +459,65 @@ mod tests {
         assert_eq!(code, 400);
     }
 
+    #[test]
+    fn resign_refresh_bumps_expiry() {
+        use nexus_identity::SiteIdentity;
+        let id = SiteIdentity::generate();
+        let mut store = SiteStore::new();
+        store.insert("example", "home", page_bytes("example", "home"));
+        store.set_signer(id.clone(), 3600);
+        store.sign_pages(&id, 1_000).unwrap();
+        let first: Vec<nexus_identity::SignedRecord> =
+            serde_json::from_slice(store.get_records("example", "home").unwrap()).unwrap();
+        assert_eq!(first[0].record.expires_at_unix, 1_000);
+        // A later signing round replaces (not appends) the chain.
+        store.sign_pages(&id, 2_000).unwrap();
+        let second: Vec<nexus_identity::SignedRecord> =
+            serde_json::from_slice(store.get_records("example", "home").unwrap()).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].record.expires_at_unix, 2_000);
+        id.verify_record(&second[0], 1_500).unwrap();
+    }
+
+    #[test]
+    fn background_resign_refreshes_served_records() {
+        use nexus_identity::SiteIdentity;
+        let id = SiteIdentity::generate();
+        let mut store = SiteStore::new();
+        store.insert("example", "home", page_bytes("example", "home"));
+        store.set_signer(id.clone(), 3600);
+        // Startup chain is already expired: without refresh it stays dead.
+        store.sign_pages(&id, 1).unwrap();
+        let config = ServerConfig {
+            resign_interval: Some(Duration::from_millis(100)),
+            ..ServerConfig::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || serve_with_config(listener, store, config));
+        // Wait for at least one background tick (generous margin).
+        std::thread::sleep(Duration::from_millis(500));
+        let line = nxp::encode_records_request(&nxp::RecordsRequest {
+            site: "example".into(),
+            path: "home".into(),
+        })
+        .unwrap();
+        let (code, body) = nexus_transport::fetch_raw(addr, &line).unwrap();
+        assert_eq!(code, 200);
+        let records: Vec<nexus_identity::SignedRecord> = serde_json::from_slice(&body).unwrap();
+        // Refreshed expiry must be in the future (background thread signed
+        // with now+ttl), not the stale startup value of 1.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        assert!(
+            records[0].record.expires_at_unix > now,
+            "records were not refreshed in the background"
+        );
+        id.verify_record(&records[0], now).unwrap();
+    }
+
     fn read_response(stream: &std::net::TcpStream) -> (u16, Vec<u8>) {
         use std::io::{BufRead, Read};
         let mut r = std::io::BufReader::new(stream);
@@ -415,6 +536,7 @@ mod tests {
             max_connections: 2,
             read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(5),
+            resign_interval: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -448,6 +570,7 @@ mod tests {
             max_connections: 8,
             read_timeout: Duration::from_millis(300),
             write_timeout: Duration::from_secs(5),
+            resign_interval: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
