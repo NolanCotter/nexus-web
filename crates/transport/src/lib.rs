@@ -84,12 +84,19 @@ pub fn fetch<A: ToSocketAddrs>(
     addr: A,
     req: &nxp::FetchRequest,
 ) -> Result<(u16, Vec<u8>), TransportError> {
+    fetch_raw(addr, &nxp::encode_request(req)?)
+}
+
+/// Client: one raw request line over TCP. Returns (status code, body).
+/// The line is sent verbatim (caller must terminate with `\n`); the
+/// response framing rules are identical for every verb.
+pub fn fetch_raw<A: ToSocketAddrs>(addr: A, line: &str) -> Result<(u16, Vec<u8>), TransportError> {
     let stream = TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
-    writer.write_all(nxp::encode_request(req)?.as_bytes())?;
+    writer.write_all(line.as_bytes())?;
     writer.flush()?;
     let header_line = read_line_limited(&mut reader)?;
     let header = nxp::parse_response_header(&header_line)?;
