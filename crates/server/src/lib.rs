@@ -152,6 +152,19 @@ impl SiteStore {
         v.sort();
         v
     }
+
+    /// Sorted paths served for `site` (the `LIST` verb body is this as
+    /// JSON). Empty when the site is unknown — the handler answers 404.
+    pub fn list_paths(&self, site: &str) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .pages
+            .keys()
+            .filter(|(s, _)| s == site)
+            .map(|(_, p)| p.clone())
+            .collect();
+        paths.sort();
+        paths
+    }
 }
 
 /// Default cap on concurrent connections (see `ServerConfig`).
@@ -197,8 +210,8 @@ impl Default for ServerConfig {
 pub fn handle_one(stream: &std::net::TcpStream, store: &SiteStore) -> Result<(), ServerError> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let line = nexus_transport::read_line_limited(&mut reader)?;
-    // FETCH and RECORDS share the line shape; dispatch on verb. Anything
-    // else (including malformed lines) is a 400 — never a panic.
+    // FETCH and RECORDS share the line shape; LIST stands alone (no path).
+    // Anything else (including malformed lines) is a 400 — never a panic.
     let response = match nxp::parse_request(&line) {
         Ok(req) => match store.get(&req.site, &req.path) {
             Some(body) => nxp::encode_response(200, body)?,
@@ -208,6 +221,19 @@ pub fn handle_one(stream: &std::net::TcpStream, store: &SiteStore) -> Result<(),
             Ok(req) => match store.get_records(&req.site, &req.path) {
                 Some(body) => nxp::encode_response(200, body)?,
                 None => nxp::encode_response(404, b"no records")?,
+            },
+            Err(nxp::ProtocolError::BadVerb(_)) => match nxp::parse_list_request(&line) {
+                Ok(req) => {
+                    let paths = store.list_paths(&req.site);
+                    if paths.is_empty() {
+                        nxp::encode_response(404, b"unknown site")?
+                    } else {
+                        let body = serde_json::to_vec(&paths)
+                            .map_err(|e| ServerError::Content(e.to_string()))?;
+                        nxp::encode_response(200, &body)?
+                    }
+                }
+                Err(_) => nxp::encode_response(400, b"bad request")?,
             },
             Err(_) => nxp::encode_response(400, b"bad request")?,
         },
@@ -594,5 +620,38 @@ mod tests {
             "close took too long: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn list_serves_sorted_paths_and_404s_unknown_site() {
+        let mut store = SiteStore::new();
+        store.insert("example", "home", page_bytes("example", "home"));
+        store.insert("example", "about", page_bytes("example", "about"));
+        assert_eq!(store.list_paths("example"), vec!["about", "home"]);
+        assert!(store.list_paths("ghost").is_empty());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                handle_one(&stream, &store).unwrap();
+            }
+        });
+        let line = nxp::encode_list_request(&nxp::ListRequest {
+            site: "example".into(),
+        })
+        .unwrap();
+        let (code, body) = nexus_transport::fetch_raw(addr, &line).unwrap();
+        assert_eq!(code, 200);
+        let paths: Vec<String> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paths, vec!["about", "home"]);
+
+        let line = nxp::encode_list_request(&nxp::ListRequest {
+            site: "ghost".into(),
+        })
+        .unwrap();
+        let (code, _) = nexus_transport::fetch_raw(addr, &line).unwrap();
+        assert_eq!(code, 404);
     }
 }
