@@ -47,6 +47,7 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #43 cross-session `nexus history` shared with the TUI log
 - [x] #44 federated resolver backend over RECORDS (DHT gate 2 dogfood, ADR 010)
 - [x] #45 stock server serves @name endpoint plane + federated dogfood test
+- [x] #46 DHT spike: Kademlia sim + sybil measurements → NO-GO per gates (`experiment/dht-kademlia`, path is federated→gossip)
 - Next: DHT past gates, WebVM execution.
 
 ## Notes (wave 2, 2026-09-17)
