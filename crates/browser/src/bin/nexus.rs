@@ -11,7 +11,9 @@ use std::io::{self, BufRead, Write};
 const DEFAULT_SERVER: &str = "127.0.0.1:7843";
 
 fn usage() -> &'static str {
-    "usage: nexus browse <site[/path]> [--server HOST:PORT] [--pin SITE_ID]\n\
+    "usage:\n\
+      nexus browse <site[/path]> [--server HOST:PORT] [--pin SITE_ID]\n\
+      nexus sync --server HOST:PORT --site NAME --dir PATH [--pin SITE_ID]\n\
      \n\
      commands at the prompt:\n\
        b | back       go back in history\n\
@@ -99,6 +101,98 @@ fn parse_args(args: &[String]) -> Result<(String, Option<String>, Option<String>
     Ok((server, target, pin))
 }
 
+fn sync_usage() -> &'static str {
+    "usage: nexus sync --server HOST:PORT --site NAME --dir PATH [--pin SITE_ID]"
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SyncArgs {
+    server: String,
+    site: String,
+    dir: std::path::PathBuf,
+    pin: Option<String>,
+}
+
+fn parse_sync_args(args: &[String]) -> Result<SyncArgs, i32> {
+    let mut server = None;
+    let mut site = None;
+    let mut dir = None;
+    let mut pin = None;
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "sync" => {}
+            "--server" | "--site" | "--dir" | "--pin" => {
+                let v = match it.next() {
+                    Some(v) => v.clone(),
+                    None => {
+                        eprintln!("{}", sync_usage());
+                        return Err(2);
+                    }
+                };
+                match a.as_str() {
+                    "--server" => server = Some(v),
+                    "--site" => site = Some(v),
+                    "--dir" => dir = Some(v.into()),
+                    _ => pin = Some(v),
+                }
+            }
+            s if s.starts_with('-') => {
+                eprintln!("unknown arg: {s}\n{}", sync_usage());
+                return Err(2);
+            }
+            s => {
+                eprintln!("unexpected arg: {s}\n{}", sync_usage());
+                return Err(2);
+            }
+        }
+    }
+    match (server, site, dir) {
+        (Some(server), Some(site), Some(dir)) => Ok(SyncArgs {
+            server,
+            site,
+            dir,
+            pin,
+        }),
+        _ => {
+            eprintln!("{}", sync_usage());
+            Err(2)
+        }
+    }
+}
+
+/// Mirror a whole site to a directory. Exit code is the process contract:
+/// 0 = all listed pages synced (and verified, with --pin), 1 = fetch /
+/// verify / write failure, 2 = bad arguments.
+fn cmd_sync(args: &[String]) -> i32 {
+    let parsed = match parse_sync_args(args) {
+        Ok(a) => a,
+        Err(code) => return code,
+    };
+    match nexus_browser::sync_site(
+        &parsed.server,
+        &parsed.site,
+        parsed.pin.as_deref(),
+        &parsed.dir,
+    ) {
+        Ok(report) => {
+            println!(
+                "synced {} page(s) ({} verified, {} skipped) from {} to {}",
+                report.pages,
+                report.verified,
+                report.skipped,
+                parsed.site,
+                parsed.dir.display()
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("nexus sync: {e}");
+            1
+        }
+    }
+}
+
 fn render(session: &ClientSession) {
     if let Some(v) = session.history.current() {
         println!(
@@ -164,6 +258,9 @@ fn interactive(session: &mut ClientSession) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "sync") {
+        std::process::exit(cmd_sync(&args));
+    }
     let (server, target, pin) = match parse_args(&args) {
         Ok(t) => t,
         Err(code) => std::process::exit(code),
@@ -256,5 +353,40 @@ mod tests {
         assert_eq!(parse_args(&["--nope".into()]), Err(2));
         assert_eq!(parse_args(&["--help".into()]), Err(0));
         assert_eq!(parse_args(&["browse".into(), "--pin".into()]), Err(2));
+    }
+
+    #[test]
+    fn parses_sync_args() {
+        let a = parse_sync_args(&[
+            "sync".into(),
+            "--server".into(),
+            "10.0.0.1:1".into(),
+            "--site".into(),
+            "example".into(),
+            "--dir".into(),
+            "/tmp/x".into(),
+        ])
+        .unwrap();
+        assert_eq!(a.server, "10.0.0.1:1");
+        assert_eq!(a.site, "example");
+        assert_eq!(a.pin, None);
+        let a = parse_sync_args(&[
+            "sync".into(),
+            "--server".into(),
+            "10.0.0.1:1".into(),
+            "--site".into(),
+            "example".into(),
+            "--dir".into(),
+            "/tmp/x".into(),
+            "--pin".into(),
+            "abc".into(),
+        ])
+        .unwrap();
+        assert_eq!(a.pin, Some("abc".to_string()));
+        assert_eq!(
+            parse_sync_args(&["sync".into(), "--site".into(), "e".into()]),
+            Err(2)
+        );
+        assert_eq!(parse_sync_args(&["sync".into(), "--bogus".into()]), Err(2));
     }
 }

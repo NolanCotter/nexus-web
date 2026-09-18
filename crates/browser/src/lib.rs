@@ -470,6 +470,83 @@ pub fn navigate_cached_verified(
     }
 }
 
+/// Outcome of [`sync_site`]: how many pages landed on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncReport {
+    /// Pages fetched and written.
+    pub pages: usize,
+    /// Pages verified against `pin` (subset of `pages`; all of them when
+    /// a pin is given, since unverified pages are refused, not written).
+    pub verified: usize,
+    /// Listed paths skipped as invalid (never written, never fetched).
+    pub skipped: usize,
+}
+
+/// Mirror a whole site to `dir`: LIST the paths, FETCH each page (plus
+/// RECORDS + verification when `pin` is set), and write
+/// `<dir>/<path>.json` atomically. A page that fails validation or pin
+/// verification aborts the sync with an error and writes nothing for that
+/// path (earlier paths stay written; sync is per-page atomic, not
+/// transactional).
+pub fn sync_site(
+    endpoint: &str,
+    site: &str,
+    pin: Option<&str>,
+    dir: &std::path::Path,
+) -> Result<SyncReport, BrowserError> {
+    let list_line = nexus_protocol::encode_list_request(&nexus_protocol::ListRequest {
+        site: site.to_string(),
+    })?;
+    let (code, body) = nexus_transport::fetch_raw(endpoint, &list_line)?;
+    if code != 200 {
+        return Err(BrowserError::Status(
+            code,
+            String::from_utf8_lossy(&body).into_owned(),
+        ));
+    }
+    let paths: Vec<String> = serde_json::from_slice(&body)
+        .map_err(|e| BrowserError::Content(format!("bad LIST body: {e}")))?;
+    let mut report = SyncReport {
+        pages: 0,
+        verified: 0,
+        skipped: 0,
+    };
+    for path in paths {
+        // Never let a hostile listing touch the filesystem: only wire-valid
+        // relative paths pass, and they cannot contain `..` or absolutes.
+        if !nexus_protocol::is_valid_path(&path) {
+            report.skipped += 1;
+            continue;
+        }
+        let page = match pin {
+            None => fetch_page(endpoint, site, &path)?,
+            Some(p) => {
+                let records = fetch_records(endpoint, site, &path)?;
+                if records.is_empty() {
+                    return Err(BrowserError::PinRecordsRequired(p.to_string()));
+                }
+                let page = fetch_page(endpoint, site, &path)?;
+                verify_pinned(&page, p, &path, &records, now_unix())?;
+                report.verified += 1;
+                page
+            }
+        };
+        let bytes = page
+            .to_canonical_json()
+            .map_err(|e| BrowserError::Content(e.to_string()))?;
+        let dest = dir.join(format!("{path}.json"));
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| BrowserError::Content(format!("mkdir: {e}")))?;
+        }
+        let tmp = dest.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes).map_err(|e| BrowserError::Content(format!("write: {e}")))?;
+        std::fs::rename(&tmp, &dest).map_err(|e| BrowserError::Content(format!("publish: {e}")))?;
+        report.pages += 1;
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

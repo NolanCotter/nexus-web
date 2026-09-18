@@ -7,6 +7,7 @@ Transport: TCP. One request line, one response frame, connection closes.
 ```text
 NXP/0.1 FETCH <site> <path>\n
 NXP/0.1 RECORDS <site> <path>\n
+NXP/0.1 LIST <site>\n
 ```
 
 - `site`: `[a-z0-9-]{1,64}`, no leading/trailing `-`.
@@ -14,7 +15,8 @@ NXP/0.1 RECORDS <site> <path>\n
 - Line max 4096 bytes incl. `\n`. Anything else -> server replies `400`.
 - `FETCH` returns the page body. `RECORDS` returns a JSON array of
   `SignedRecord` vouching for the page (or `404` when the server has no
-  records — e.g. started without `--key`). Unknown verbs -> `400`.
+  records. `LIST` returns a JSON array of the site's paths (or `404` for an
+  unknown site) — e.g. started without `--key`). Unknown verbs -> `400`.
 
 ## Response
 

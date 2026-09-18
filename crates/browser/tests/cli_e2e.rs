@@ -84,3 +84,77 @@ fn nexus_binary_browses_back_forward_over_tcp() {
     assert!(stdout.contains("=> 2. @example /about"));
     assert!(!stdout.contains("=> 1. @example /home"));
 }
+
+#[test]
+fn nexus_sync_mirrors_site_to_dir() {
+    let addr = spawn_store();
+    let dir = std::env::temp_dir().join(format!("nexus-sync-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nexus"))
+        .args([
+            "sync",
+            "--server",
+            &addr.to_string(),
+            "--site",
+            "example",
+            "--dir",
+            dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("synced 2 page(s)"), "stdout: {stdout}");
+
+    // Synced files load back as valid pages through the normal path.
+    let mut store = nexus_server::SiteStore::new();
+    let n = store.load_dir("example", &dir).unwrap();
+    assert_eq!(n, 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nexus_sync_verified_mirrors_with_chain() {
+    let mut store = nexus_server::SiteStore::new();
+    store.insert(
+        "example",
+        "home",
+        page_bytes("example", "home", "Example Home"),
+    );
+    let id = nexus_identity::SiteIdentity::from_secret_bytes(&[51u8; 32]).unwrap();
+    store.sign_pages(&id, 9_999_999_999).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        // LIST + RECORDS + FETCH.
+        for _ in 0..3 {
+            let (stream, _) = listener.accept().unwrap();
+            nexus_server::handle_one(&stream, &store).unwrap();
+        }
+    });
+    let dir = std::env::temp_dir().join(format!("nexus-sync-pin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nexus"))
+        .args([
+            "sync",
+            "--server",
+            &addr.to_string(),
+            "--site",
+            "example",
+            "--dir",
+            dir.to_str().unwrap(),
+            "--pin",
+            &id.site_id(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1 verified"), "stdout: {stdout}");
+    assert!(dir.join("home.json").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
