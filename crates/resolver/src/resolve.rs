@@ -578,7 +578,13 @@ pub struct CachingResolver<B: Backend = MemoryBackend> {
     table: Mutex<LocalResolver>,
     store: Mutex<RecordStore>,
     backends: Vec<B>,
+    negatives: Mutex<HashMap<String, std::time::Instant>>,
+    negative_ttl: std::time::Duration,
 }
+
+/// How long an authoritative miss stays cached (default; see
+/// [`CachingResolver::with_negative_ttl`]).
+pub const DEFAULT_NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl<B: Backend> CachingResolver<B> {
     /// Build over a warm table, a store, and an ordered backend list.
@@ -587,17 +593,48 @@ impl<B: Backend> CachingResolver<B> {
             table: Mutex::new(table),
             store: Mutex::new(store),
             backends,
+            negatives: Mutex::new(HashMap::new()),
+            negative_ttl: DEFAULT_NEGATIVE_TTL,
         }
     }
 
-    /// Trust anchor + direct (offline) record admission.
+    /// Cache authoritative misses for `ttl` instead of the default 60s.
+    /// Short TTLs re-query sooner; `Duration::ZERO` disables negatives.
+    pub fn with_negative_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.negative_ttl = ttl;
+        self
+    }
+
+    /// Drop the cached negative for `name`, if any (new information may
+    /// have arrived out-of-band).
+    fn clear_negative(&self, name: &str) {
+        lock_ignoring_poison(&self.negatives).remove(name);
+    }
+
+    /// True while a fresh authoritative miss covers `name`.
+    fn is_negative(&self, name: &str) -> bool {
+        let negatives = lock_ignoring_poison(&self.negatives);
+        match negatives.get(name) {
+            Some(at) => at.elapsed() < self.negative_ttl,
+            None => false,
+        }
+    }
+
+    /// Trust anchor + direct (offline) record admission. Clears any
+    /// cached negative: a new anchor is new information.
     pub fn trust(&mut self, name: &str, verify: VerifyingKey) {
         lock_ignoring_poison(&self.store).trust(name, verify);
+        self.clear_negative(name);
     }
 
     /// Direct record admission (bypasses backends; offline publishing).
+    /// Clears any cached negative for the name.
     pub fn admit_record(&mut self, name: &str, record: EndpointRecord) -> bool {
-        lock_ignoring_poison(&self.store).admit(name, record)
+        let admitted = lock_ignoring_poison(&self.store).admit(name, record);
+        if admitted {
+            self.clear_negative(name);
+        }
+        admitted
     }
 
     /// Direct revocation admission; invalidates the warmed table entry so
@@ -626,9 +663,24 @@ impl<B: Backend> Resolver for CachingResolver<B> {
         if let Ok(route) = lock_ignoring_poison(&self.table).resolve(name) {
             return Ok(route);
         }
-        // 2. Cold path: pull records from backends, verify, admit.
+        // 2. Fresh authoritative miss: fail fast without touching backends.
+        if self.is_negative(name) {
+            return Err(ResolveError::UnknownSite(name.to_string()));
+        }
+        // 3. Cold path: pull records from backends, verify, admit. An
+        // authoritative empty from every backend with zero records seen
+        // caches a negative for `negative_ttl`; transport failures and
+        // rejected (forged/stale) records never do.
+        let mut saw_records = false;
+        let mut authoritative_empty = false;
         for backend in &self.backends {
-            for signed in backend.fetch(name) {
+            let answer = backend.fetch_authoritative(name);
+            if answer.records.is_empty() {
+                authoritative_empty = authoritative_empty || answer.authoritative;
+                continue;
+            }
+            saw_records = true;
+            for signed in answer.records {
                 // Endpoint records are carried under path "@{name}" inside
                 // the identity record envelope (see backend.rs docs).
                 if signed.record.path != format!("@{name}") {
@@ -657,7 +709,13 @@ impl<B: Backend> Resolver for CachingResolver<B> {
                 }
             }
         }
-        // 3. Verified store may already hold a route (offline warm cache).
+        // 4. Authoritative emptiness with nothing seen: remember the miss
+        // so the next resolve fails fast until `negative_ttl` lapses.
+        if !saw_records && authoritative_empty && !self.negative_ttl.is_zero() {
+            lock_ignoring_poison(&self.negatives)
+                .insert(name.to_string(), std::time::Instant::now());
+        }
+        // 5. Verified store may already hold a route (offline warm cache).
         lock_ignoring_poison(&self.store)
             .route(name)
             .ok_or_else(|| ResolveError::UnknownSite(name.to_string()))

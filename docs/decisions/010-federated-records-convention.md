@@ -65,6 +65,8 @@ a poisoned or unreachable endpoint cannot veto a valid answer.
 
 - No client-side caching/TTL of fetched records (the warm-table fast path
   already bypasses backends; see 009).
-- No negative cache for authoritative 404s; no refresh without a cold miss.
+- ~~No negative cache for authoritative 404s~~ DONE 2026-09-18:
+  `Backend::fetch_authoritative` + TTL negative cache on misses
+  (failures/forgeries never cached); no refresh without a cold miss.
 - No publish path: NXP/0.1 has no push verb, so records are signed and
   published out-of-band at the resolver (DNS model).

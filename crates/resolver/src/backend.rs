@@ -33,6 +33,16 @@ pub enum BackendError {
     Refused(String),
 }
 
+/// One backend's answer: the envelopes plus whether an empty answer is
+/// authoritative (positive knowledge of nothing, not a failure).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendAnswer {
+    /// Raw envelopes (possibly empty).
+    pub records: Vec<SignedRecord>,
+    /// True only when empty means "nothing here" (all endpoints answered).
+    pub authoritative: bool,
+}
+
 /// A backend is a *transport* for signed records. It never validates, never
 /// merges — it moves envelopes and reports failures. Sync facade over
 /// internally-async machinery: a QUIC or Kademlia backend runs its I/O on
@@ -45,6 +55,19 @@ pub trait Backend: Debug + Send + Sync {
     /// Best-effort pull of signed records relevant to `name`. Returning an
     /// empty vec is NOT an error (backend down / nothing known / in flight).
     fn fetch(&self, name: &str) -> Vec<SignedRecord>;
+
+    /// Same pull, plus whether the answer is *authoritative*: true means the
+    /// backend positively knows it holds nothing for `name` (e.g. every
+    /// endpoint answered 404 with no transport failures). Only authoritative
+    /// emptiness may feed negative caching — a bare empty vec says nothing.
+    /// The default (unknown authority) keeps custom backends source-
+    /// compatible: they simply never contribute negatives.
+    fn fetch_authoritative(&self, name: &str) -> BackendAnswer {
+        BackendAnswer {
+            records: self.fetch(name),
+            authoritative: false,
+        }
+    }
 
     /// Give the backend a valid record to propagate/replicate. Best-effort.
     fn advertise(&self, record: &SignedRecord) -> Result<(), BackendError> {
@@ -141,11 +164,19 @@ impl Backend for FederatedBackend {
     }
 
     fn fetch(&self, name: &str) -> Vec<SignedRecord> {
+        self.fetch_authoritative(name).records
+    }
+
+    fn fetch_authoritative(&self, name: &str) -> BackendAnswer {
         if !crate::is_valid_name(name) {
-            return Vec::new(); // the core rejects invalid names anyway
+            return BackendAnswer {
+                records: Vec::new(),
+                authoritative: false,
+            };
         }
         let mut stats = crate::lock_ignoring_poison(&self.stats);
         let mut out = Vec::new();
+        let mut failures = 0u64;
         for endpoint in &self.endpoints {
             stats.requests += 1;
             match query(endpoint, name) {
@@ -154,10 +185,18 @@ impl Backend for FederatedBackend {
                     stats.records += records.len() as u64;
                     out.append(&mut records);
                 }
-                Err(_) => stats.failures += 1, // availability over single answers
+                Err(_) => {
+                    stats.failures += 1; // availability over single answers
+                    failures += 1;
+                }
             }
         }
-        out
+        // Authoritative only when every endpoint answered (404 or records)
+        // with zero transport failures: emptiness is positive knowledge.
+        BackendAnswer {
+            records: out,
+            authoritative: failures == 0,
+        }
     }
 }
 
@@ -273,6 +312,14 @@ impl Backend for MemoryBackend {
             .filter(|r| r.record.path == format!("@{name}"))
             .cloned()
             .collect()
+    }
+
+    fn fetch_authoritative(&self, name: &str) -> BackendAnswer {
+        // In-memory map: complete knowledge by construction.
+        BackendAnswer {
+            records: self.fetch(name),
+            authoritative: true,
+        }
     }
 
     fn advertise(&self, record: &SignedRecord) -> Result<(), BackendError> {

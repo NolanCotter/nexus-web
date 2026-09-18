@@ -48,6 +48,7 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #44 federated resolver backend over RECORDS (DHT gate 2 dogfood, ADR 010)
 - [x] #45 stock server serves @name endpoint plane + federated dogfood test
 - [x] #46 DHT spike: Kademlia sim + sybil measurements → NO-GO per gates (`experiment/dht-kademlia`, path is federated→gossip)
+- [x] #47 authoritative negative caching with TTL (failures/forgeries never cached)
 - Next: DHT past gates, WebVM execution.
 
 ## Notes (wave 2, 2026-09-17)

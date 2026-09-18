@@ -361,3 +361,65 @@ fn invalid_names_never_hit_the_wire() {
         Err(ResolveError::InvalidName(_))
     ));
 }
+
+#[test]
+fn authoritative_empty_caches_negative_until_ttl() {
+    let k = test_key(20);
+    let server = spawn_server(HashMap::new()); // 404 for every name
+    let mut store = RecordStore::with_clock(now);
+    store.trust("nobody", k.verifying_key());
+    let r = CachingResolver::new(
+        LocalResolver::new(),
+        store,
+        vec![FederatedBackend::new(vec![server])],
+    )
+    .with_negative_ttl(std::time::Duration::from_millis(80));
+    // First miss hits the wire; second is served from the negative cache.
+    assert_unknown(&r, "nobody");
+    assert_unknown(&r, "nobody");
+    assert_eq!(r.backends()[0].stats().requests, 1);
+    // After the TTL lapses the backend is consulted again.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert_unknown(&r, "nobody");
+    assert_eq!(r.backends()[0].stats().requests, 2);
+}
+
+#[test]
+fn transport_failure_never_caches_negative() {
+    let k = test_key(21);
+    let mut store = RecordStore::with_clock(now);
+    store.trust("nobody", k.verifying_key());
+    let r = CachingResolver::new(
+        LocalResolver::new(),
+        store,
+        vec![FederatedBackend::new(vec![closed_port()])],
+    )
+    .with_negative_ttl(std::time::Duration::from_secs(3600));
+    // Failures are not knowledge: every resolve retries the wire.
+    assert_unknown(&r, "nobody");
+    assert_unknown(&r, "nobody");
+    let stats = r.backends()[0].stats();
+    assert_eq!((stats.requests, stats.failures), (2, 2));
+}
+
+#[test]
+fn admitted_record_clears_negative() {
+    let k = test_key(22);
+    let server = spawn_server(HashMap::new());
+    let mut store = RecordStore::with_clock(now);
+    store.trust("nobody", k.verifying_key());
+    let mut r = CachingResolver::new(
+        LocalResolver::new(),
+        store,
+        vec![FederatedBackend::new(vec![server])],
+    );
+    assert_unknown(&r, "nobody");
+    assert_eq!(r.backends()[0].stats().requests, 1);
+    // Out-of-band valid record clears the negative: the next resolve
+    // consults the backend again (requests 1 -> 2 proves no fast-fail)
+    // and then serves the admitted record from the store.
+    assert!(r.admit_record("nobody", make_record(&k, "10.0.0.9", 9, 1)));
+    let route = r.resolve("nobody").unwrap();
+    assert_eq!(route.endpoints, vec!["10.0.0.9:9"]);
+    assert_eq!(r.backends()[0].stats().requests, 2);
+}
