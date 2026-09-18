@@ -65,6 +65,15 @@ struct Entry {
     pin: Option<String>,
 }
 
+/// Outcome of [`OfflineCache::gc`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GcReport {
+    /// Blob/tmp files deleted.
+    pub files_removed: usize,
+    /// Sum of deleted file sizes.
+    pub bytes_freed: u64,
+}
+
 /// Disk-backed cache shared by every CLI invocation.
 #[derive(Debug)]
 pub struct OfflineCache {
@@ -86,6 +95,19 @@ fn key(site: &str, path: &str) -> String {
 
 fn valid_key(site: &str, path: &str) -> bool {
     nexus_protocol::is_valid_site(site) && nexus_protocol::is_valid_path(path)
+}
+
+/// True for canonical `b3:<64 lowercase hex>` ids (the only names the blob
+/// store itself ever creates; anything else on disk is foreign).
+fn is_blob_id(id: &str) -> bool {
+    let hex = match id.strip_prefix("b3:") {
+        Some(h) => h,
+        None => return false,
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 impl OfflineCache {
@@ -279,6 +301,61 @@ impl OfflineCache {
         }
     }
 
+    /// Garbage-collect the blob store: delete `*.tmp` leftovers from
+    /// interrupted writes and valid content blobs no live index entry points
+    /// at (superseded revisions, evicted chains, corruption leftovers).
+    /// Files that do not look like content blobs are left alone. Returns
+    /// what was removed. Concurrent `put`s may race a collection run;
+    /// treat GC as maintenance, not as synchronized with fetching.
+    pub fn gc(&self) -> GcReport {
+        use std::collections::HashSet;
+        let mut report = GcReport::default();
+        // Live set: every blob id named by the index (pages + chains).
+        let mut live: HashSet<String> = HashSet::new();
+        if let Ok(idx) = self.read_index() {
+            for entry in idx.pages.values() {
+                live.insert(entry.content_id.clone());
+                live.extend(entry.records_id.clone());
+            }
+        }
+        let blobs_root = self.blobs.dir();
+        let Ok(root) = std::fs::read_dir(blobs_root) else {
+            return report;
+        };
+        for shard in root.flatten() {
+            let Ok(level) = std::fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for file in level.flatten() {
+                let name = file.file_name().to_string_lossy().into_owned();
+                // Interrupted-write leftovers always go.
+                if name.ends_with(".tmp") {
+                    if let Ok(meta) = file.metadata() {
+                        report.bytes_freed += meta.len();
+                        report.files_removed += 1;
+                    }
+                    let _ = std::fs::remove_file(file.path());
+                    continue;
+                }
+                // Reconstruct the content id this file would carry.
+                let shard_name = shard.file_name().to_string_lossy().into_owned();
+                let id = format!("b3:{shard_name}{name}");
+                if !is_blob_id(&id) {
+                    continue; // foreign file: not ours, don't touch
+                }
+                if live.contains(&id) {
+                    continue;
+                }
+                if let Ok(meta) = file.metadata() {
+                    report.bytes_freed += meta.len();
+                    report.files_removed += 1;
+                }
+                let _ = std::fs::remove_file(file.path());
+            }
+        }
+        report
+    }
+
     pub fn remove(&self, site: &str, path: &str) {
         if !valid_key(site, path) {
             return;
@@ -351,6 +428,33 @@ mod tests {
             .unwrap(); // invalid site: no-op
         assert!(c.lookup("Example", "home").is_none());
         assert!(!dir.join("index.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gc_reaps_orphans_and_tmp_but_not_foreign() {
+        let dir = temp_dir("gc");
+        let c = OfflineCache::new(&dir);
+        c.put("example", "home", &page("example", "home", 1))
+            .unwrap();
+        c.put("example", "home", &page("example", "home", 2))
+            .unwrap();
+        // One live blob (rev 2); rev 1 is orphaned.
+        // Foreign file + stale tmp alongside the shards:
+        let shard = dir.join("blobs").join("ab");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("not-a-blob"), b"hands off").unwrap();
+        std::fs::write(shard.join("deadbeef.tmp"), b"partial").unwrap();
+        let report = c.gc();
+        assert_eq!(
+            report.files_removed, 2,
+            "orphan blob + tmp, not the foreign file"
+        );
+        assert!(report.bytes_freed > 0);
+        assert!(shard.join("not-a-blob").exists());
+        assert!(!shard.join("deadbeef.tmp").exists());
+        // Live entry still serves after collection.
+        assert!(c.lookup("example", "home").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -14,6 +14,7 @@ fn usage() -> &'static str {
     "usage:\n\
       nexus browse <site[/path]> [--server HOST:PORT] [--pin SITE_ID]\n\
       nexus sync --server HOST:PORT --site NAME --dir PATH [--pin SITE_ID]\n\
+      nexus cache-gc [--dir PATH]\n\
      \n\
      commands at the prompt:\n\
        b | back       go back in history\n\
@@ -193,6 +194,43 @@ fn cmd_sync(args: &[String]) -> i32 {
     }
 }
 
+/// Delete orphaned cache blobs and interrupted-write leftovers.
+/// Exit 0 with a report line; never fails on a missing/empty cache.
+fn cmd_cache_gc(args: &[String]) -> i32 {
+    let mut dir: Option<std::path::PathBuf> = None;
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "cache-gc" => {}
+            "--dir" => match it.next() {
+                Some(v) => dir = Some(v.into()),
+                None => {
+                    eprintln!("usage: nexus cache-gc [--dir PATH]");
+                    return 2;
+                }
+            },
+            s if s.starts_with('-') => {
+                eprintln!("unknown arg: {s}\nusage: nexus cache-gc [--dir PATH]");
+                return 2;
+            }
+            s => {
+                eprintln!("unexpected arg: {s}\nusage: nexus cache-gc [--dir PATH]");
+                return 2;
+            }
+        }
+    }
+    let cache = match dir {
+        Some(d) => nexus_browser::OfflineCache::new(d),
+        None => nexus_browser::OfflineCache::open_default(),
+    };
+    let report = cache.gc();
+    println!(
+        "collected {} file(s), freed {} byte(s)",
+        report.files_removed, report.bytes_freed
+    );
+    0
+}
+
 fn render(session: &ClientSession) {
     if let Some(v) = session.history.current() {
         println!(
@@ -260,6 +298,9 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "sync") {
         std::process::exit(cmd_sync(&args));
+    }
+    if args.first().is_some_and(|a| a == "cache-gc") {
+        std::process::exit(cmd_cache_gc(&args));
     }
     let (server, target, pin) = match parse_args(&args) {
         Ok(t) => t,

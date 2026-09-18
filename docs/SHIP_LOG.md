@@ -42,6 +42,7 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #38 verified offline cache: pinned chains cached + re-verified stale serve (`--pin` works offline)
 - [x] #39 LIST verb + `nexus sync` site mirroring (verified with --pin)
 - [x] #40 demo covers signed flow: keyed server, pin accept/refuse, verified sync
+- [x] #41 cache GC: orphan/tmp reaping + `nexus cache-gc` (foreign files untouched)
 - Next: DHT past gates, WebVM execution.
 
 ## Notes (wave 2, 2026-09-17)
