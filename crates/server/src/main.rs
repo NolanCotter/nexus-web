@@ -99,6 +99,9 @@ fn main() {
     for (s, p) in store.routes() {
         eprintln!("  route: {s}/{p}");
     }
+    for name in store.endpoint_routes() {
+        eprintln!("  endpoint records: {name}/@{name}");
+    }
 
     // Optional identity: with --key, every page is signed at startup and
     // served over RECORDS. Missing key file is generated (0600); without

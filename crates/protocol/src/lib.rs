@@ -139,8 +139,15 @@ pub fn encode_request(req: &FetchRequest) -> Result<String, ProtocolError> {
     encode_request_line("FETCH", &req.site, &req.path)
 }
 
-/// Encode a `RECORDS` request to its wire line. Same validation as FETCH.
+/// Encode a `RECORDS` request to its wire line. Same validation as FETCH,
+/// plus the `@<site>` endpoint namespace (mirrors the parse rule).
 pub fn encode_records_request(req: &RecordsRequest) -> Result<String, ProtocolError> {
+    if let Some(name) = req.path.strip_prefix('@') {
+        if name.is_empty() || *name != req.site || !is_valid_site(&req.site) {
+            return Err(ProtocolError::BadPath(req.path.clone()));
+        }
+        return Ok(format!("{VERSION} RECORDS {} {}\n", req.site, req.path));
+    }
     encode_request_line("RECORDS", &req.site, &req.path)
 }
 
@@ -175,11 +182,20 @@ pub fn parse_request(line: &str) -> Result<FetchRequest, ProtocolError> {
 }
 
 /// Parse one `RECORDS` request line (untrusted input). Same rules as
-/// [`parse_request`]; only the verb differs.
+/// [`parse_request`], except the path may instead be exactly `@<site>`
+/// (the endpoint-record namespace, ADR 010): `@` is not a valid content
+/// path and never reaches content stores — the server dispatches it to
+/// the endpoint plane before any page lookup.
 pub fn parse_records_request(line: &str) -> Result<RecordsRequest, ProtocolError> {
     let (verb, site, path) = split_request_line(line)?;
     if verb != "RECORDS" {
         return Err(ProtocolError::BadVerb(verb));
+    }
+    if let Some(name) = path.strip_prefix('@') {
+        if name.is_empty() || name != site.as_str() || !is_valid_site(&site) {
+            return Err(ProtocolError::BadPath(path));
+        }
+        return Ok(RecordsRequest { site, path });
     }
     check_site_path(&site, &path, line)?;
     Ok(RecordsRequest { site, path })
@@ -400,6 +416,45 @@ mod tests {
             Err(ProtocolError::BadVerb(_))
         ));
         assert!(encode_list_request(&ListRequest { site: "".into() }).is_err());
+    }
+
+    #[test]
+    fn records_at_namespace_roundtrip() {
+        // `RECORDS <name> @<name>`: endpoint plane, ADR 010.
+        let req = RecordsRequest {
+            site: "alice".into(),
+            path: "@alice".into(),
+        };
+        let line = encode_records_request(&req).unwrap();
+        assert_eq!(line, "NXP/0.1 RECORDS alice @alice\n");
+        assert_eq!(parse_records_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn records_at_namespace_rejects_mismatch() {
+        // Bare `@`, cross-name, traversal, and bad-site forms all fail.
+        for bad in [
+            "NXP/0.1 RECORDS alice @\n",
+            "NXP/0.1 RECORDS alice @other\n",
+            "NXP/0.1 RECORDS alice @../x\n",
+            "NXP/0.1 RECORDS Alice @Alice\n",
+            "NXP/0.1 RECORDS alice @alice extra\n",
+        ] {
+            assert!(
+                parse_records_request(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        // FETCH never admits the namespace.
+        assert!(matches!(
+            parse_request("NXP/0.1 FETCH alice @alice\n"),
+            Err(ProtocolError::BadPath(_))
+        ));
+        assert!(encode_records_request(&RecordsRequest {
+            site: "alice".into(),
+            path: "@other".into(),
+        })
+        .is_err());
     }
 
     #[test]

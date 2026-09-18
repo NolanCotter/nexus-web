@@ -40,6 +40,9 @@ pub enum ServerError {
 pub struct SiteStore {
     pages: HashMap<(String, String), Vec<u8>>,
     records: HashMap<(String, String), Vec<u8>>,
+    /// Endpoint records by name (`RECORDS <name> @<name>`): the federated
+    /// resolution plane (ADR 010). Keyed by name, not (site, path).
+    endpoint_records: HashMap<String, Vec<u8>>,
     signer: Option<SignerState>,
 }
 
@@ -75,6 +78,24 @@ impl SiteStore {
         self.records
             .get(&(site.to_string(), path.to_string()))
             .map(Vec::as_slice)
+    }
+
+    /// Insert a pre-signed endpoint-record chain for `name` (JSON array of
+    /// `SignedRecord`; validation is the client's job, see ADR 010).
+    pub fn insert_endpoint_records(&mut self, name: &str, chain_json: Vec<u8>) {
+        self.endpoint_records.insert(name.to_string(), chain_json);
+    }
+
+    /// Look up the endpoint-record chain for `name`, if any.
+    pub fn get_endpoint_records(&self, name: &str) -> Option<&[u8]> {
+        self.endpoint_records.get(name).map(Vec::as_slice)
+    }
+
+    /// Sorted names with endpoint chains (startup logging).
+    pub fn endpoint_routes(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.endpoint_records.keys().cloned().collect();
+        v.sort();
+        v
     }
 
     /// Install the identity + TTL used for background re-signing. The next
@@ -143,6 +164,44 @@ impl SiteStore {
             self.insert(site, stem, bytes);
             count += 1;
         }
+        // Optional `endpoints/` subdir: `<name>.json` files holding JSON
+        // arrays of SignedRecord, served at `RECORDS <name> @<name>`
+        // (ADR 010). Missing dir = no endpoint records, not an error.
+        let endpoints = dir.join("endpoints");
+        if endpoints.is_dir() {
+            let entries =
+                std::fs::read_dir(&endpoints).map_err(|e| ServerError::Content(e.to_string()))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| ServerError::Content(e.to_string()))?;
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| ServerError::Content("bad endpoint filename".into()))?;
+                if !nxp::is_valid_site(name) {
+                    return Err(ServerError::Content(format!(
+                        "bad endpoint name in {}",
+                        path.display()
+                    )));
+                }
+                let bytes =
+                    std::fs::read(&path).map_err(|e| ServerError::Content(e.to_string()))?;
+                // Fail loud on garbage: must be a JSON array (element shape
+                // is the client's verification job, not the server's).
+                let v: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| ServerError::Content(format!("{}: {e}", path.display())))?;
+                if !v.is_array() {
+                    return Err(ServerError::Content(format!(
+                        "{}: endpoint chain must be a JSON array",
+                        path.display()
+                    )));
+                }
+                self.insert_endpoint_records(name, bytes);
+            }
+        }
         Ok(count)
     }
 
@@ -202,6 +261,19 @@ impl Default for ServerConfig {
     }
 }
 
+/// Split an `@name` record path into its endpoint name. Returns `Some`
+/// only when the path is exactly `@<site>` with a valid site name —
+/// anything else (`@` alone, `@other`, `@../x`) is not an endpoint lookup.
+/// Note: `@` never reaches [`nxp::is_valid_path`] (content paths); this is
+/// the only place the `@` namespace exists on the server.
+fn endpoint_name(site: &str, path: &str) -> Option<String> {
+    let name = path.strip_prefix('@')?;
+    if name.is_empty() || name != site || !nxp::is_valid_site(name) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 /// Handle one connection: read request line, write one response, close.
 ///
 /// The caller is responsible for read/write deadlines on `stream`
@@ -218,9 +290,16 @@ pub fn handle_one(stream: &std::net::TcpStream, store: &SiteStore) -> Result<(),
             None => nxp::encode_response(404, b"not found")?,
         },
         Err(nxp::ProtocolError::BadVerb(_)) => match nxp::parse_records_request(&line) {
-            Ok(req) => match store.get_records(&req.site, &req.path) {
-                Some(body) => nxp::encode_response(200, body)?,
-                None => nxp::encode_response(404, b"no records")?,
+            Ok(req) => match endpoint_name(&req.site, &req.path) {
+                // `@name` namespace: federated endpoint records (ADR 010).
+                Some(name) => match store.get_endpoint_records(&name) {
+                    Some(body) => nxp::encode_response(200, body)?,
+                    None => nxp::encode_response(404, b"no records")?,
+                },
+                None => match store.get_records(&req.site, &req.path) {
+                    Some(body) => nxp::encode_response(200, body)?,
+                    None => nxp::encode_response(404, b"no records")?,
+                },
             },
             Err(nxp::ProtocolError::BadVerb(_)) => match nxp::parse_list_request(&line) {
                 Ok(req) => {
@@ -653,5 +732,76 @@ mod tests {
         .unwrap();
         let (code, _) = nexus_transport::fetch_raw(addr, &line).unwrap();
         assert_eq!(code, 404);
+    }
+
+    #[test]
+    fn endpoint_records_serve_over_at_namespace() {
+        let mut store = SiteStore::new();
+        store.insert_endpoint_records("alice", br#"[{"record":{"site":"s","path":"@alice","content_hash":"b3:x","expires_at_unix":9},"signature_hex":"aa"}]"#.to_vec());
+        assert_eq!(store.endpoint_routes(), vec!["alice"]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            // Valid @alice, mismatched @other, bare @, unknown name.
+            for _ in 0..4 {
+                let (stream, _) = listener.accept().unwrap();
+                handle_one(&stream, &store).unwrap();
+            }
+        });
+        let good = nxp::encode_records_request(&nxp::RecordsRequest {
+            site: "alice".into(),
+            path: "@alice".into(),
+        })
+        .unwrap();
+        let (code, body) = nexus_transport::fetch_raw(addr, &good).unwrap();
+        assert_eq!(code, 200);
+        assert!(body.starts_with(b"["));
+
+        // @other against site alice: the encoder refuses to build it, so
+        // send the raw hostile line — malformed (400), never served.
+        let (code, _) = nexus_transport::fetch_raw(addr, "NXP/0.1 RECORDS alice @other\n").unwrap();
+        assert_eq!(code, 400);
+        let (code, _) = nexus_transport::fetch_raw(addr, "NXP/0.1 RECORDS alice @\n").unwrap();
+        assert_eq!(code, 400);
+        // Unknown name with well-formed @: 404, not 400.
+        let ghost = nxp::encode_records_request(&nxp::RecordsRequest {
+            site: "ghost".into(),
+            path: "@ghost".into(),
+        })
+        .unwrap();
+        let (code, _) = nexus_transport::fetch_raw(addr, &ghost).unwrap();
+        assert_eq!(code, 404);
+    }
+
+    #[test]
+    fn endpoints_subdir_loads_and_rejects_garbage() {
+        let dir = std::env::temp_dir().join(format!("nexus-endpoints-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("endpoints")).unwrap();
+        std::fs::write(dir.join("endpoints").join("alice.json"), b"[]").unwrap();
+        std::fs::write(
+            dir.join("home.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": {"schema": 1, "site": "example", "path": "home",
+                             "title": "T", "revision": 1},
+                "components": [{"type": "text", "text": "hi"}],
+                "capabilities": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut store = SiteStore::new();
+        assert_eq!(store.load_dir("example", &dir).unwrap(), 1);
+        assert_eq!(store.endpoint_routes(), vec!["alice"]);
+
+        // Non-array JSON and bad names fail loud.
+        std::fs::write(dir.join("endpoints").join("bob.json"), b"{}").unwrap();
+        let mut bad = SiteStore::new();
+        assert!(bad.load_dir("example", &dir).is_err());
+        std::fs::write(dir.join("endpoints").join("bob.json"), b"[]").unwrap();
+        std::fs::write(dir.join("endpoints").join("BAD.json"), b"[]").unwrap();
+        let mut bad2 = SiteStore::new();
+        assert!(bad2.load_dir("example", &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

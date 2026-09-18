@@ -14,9 +14,13 @@ NXP/0.1 LIST <site>\n
 - `path`: `[A-Za-z0-9/_.\-+]{1,256}`, no `..`, no `//`, no leading `/`. Example: `home`, `blog/hello`.
 - Line max 4096 bytes incl. `\n`. Anything else -> server replies `400`.
 - `FETCH` returns the page body. `RECORDS` returns a JSON array of
-  `SignedRecord` vouching for the page (or `404` when the server has no
-  records. `LIST` returns a JSON array of the site's paths (or `404` for an
-  unknown site) — e.g. started without `--key`). Unknown verbs -> `400`.
+  `SignedRecord` vouching for the page. `LIST` returns a JSON array of the
+  site's paths. `404` means not found / no records (e.g. a server started
+  without `--key` has no chains) / unknown site. Unknown verbs -> `400`.
+- `RECORDS` also serves the endpoint plane: `RECORDS <name> @<name>`
+  returns the name's endpoint-record chain (federated resolution, ADR 010).
+  The `@` path must equal `@` + site exactly; anything else is `400`.
+  `FETCH` never admits `@` paths.
 
 ## Response
 

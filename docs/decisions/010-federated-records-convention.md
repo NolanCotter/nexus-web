@@ -38,15 +38,17 @@ NXP/0.1 200 <len>\n<JSON array of SignedRecord>
 - Any other code, an undecodable body, or a transport error = the backend
   records a failure and returns nothing.
 
-## Deviation from the stock parser (documented, deliberate)
+## Deviation from the stock parser (documented, deliberate — closed 2026-09-18)
 
 `nexus_protocol::is_valid_path` validates *content* paths and rejects `@`, so
-the backend builds the request line verbatim and record servers must accept
-`@name` paths. Rationale: the RECORDS verb, frame shape, size limits, and JSON
-response body are reused exactly — nothing new on the wire. The `@` is the
-record-namespace marker, not a protocol change; name bytes still pass
-`is_valid_site`, so the line carries no injection characters. A stock server
-answering `400` is treated as a transport failure.
+`parse_records_request` admits exactly `@<site>` (and the encoder builds it)
+while `parse_request` (FETCH) never does. Stock servers serve the endpoint
+plane from `endpoints/<name>.json` via `SiteStore::insert_endpoint_records`.
+Rationale: the RECORDS verb, frame shape, size limits, and JSON response body
+are reused exactly — nothing new on the wire. The `@` is the record-namespace
+marker, not a protocol change; name bytes still pass `is_valid_site`, so the
+line carries no injection characters. A server answering `400` is treated as
+a transport failure.
 
 ## Security model
 
