@@ -18,6 +18,12 @@
 //!   before serving. Corruption, invalid pages, or metadata mismatches are a
 //!   miss and evict the entry; a page failing `Page::validate` is never served.
 //! - Evicted/superseded blob revisions remain in the CAS (GC is future work).
+//!
+//! Verified entries (pinning + offline): [`OfflineCache::put_verified`]
+//! stores the page together with the signed chain that vouched for it and
+//! the pinned site id. [`OfflineCache::lookup_verified`] re-verifies the
+//! chain before serving, so a pinned page stays trustworthy with no
+//! network. A chain that no longer verifies is a miss and evicts the entry.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -29,12 +35,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::BrowserError;
 
-/// How a page was obtained. `Stale` is the offline banner marker: served
-/// from cache after a transport failure instead of the network.
+/// How a page was obtained. `Stale`/`StaleVerified` are the offline banner
+/// markers: served from cache after a transport failure instead of the
+/// network (`StaleVerified` additionally re-checked the record chain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheStatus {
-    Fresh, // served from the network on this fetch
-    Stale, // served from cache (offline)
+    /// Served from the network on this fetch.
+    Fresh,
+    /// Served from cache (offline), unverified.
+    Stale,
+    /// Served from cache (offline) with the pinned chain re-verified.
+    StaleVerified,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -46,6 +57,12 @@ struct Index {
 struct Entry {
     content_id: String,
     fetched_at: u64,
+    /// CAS id of the JSON-encoded record chain, if the fetch was verified.
+    #[serde(default)]
+    records_id: Option<String>,
+    /// Pinned site id the chain was verified against, if any.
+    #[serde(default)]
+    pin: Option<String>,
 }
 
 /// Disk-backed cache shared by every CLI invocation.
@@ -118,6 +135,34 @@ impl OfflineCache {
     /// Best-effort store of a validated page under (site, path), replacing
     /// any previous revision (cache writes never fail a fresh fetch).
     pub fn put(&self, site: &str, path: &str, page: &Page) -> Result<(), BrowserError> {
+        self.put_inner(site, path, page, None, None)
+    }
+
+    /// Best-effort store of a verified fetch: the page plus the record
+    /// chain that vouched for it and the pinned site id. Replaces any
+    /// previous revision.
+    pub fn put_verified(
+        &self,
+        site: &str,
+        path: &str,
+        page: &Page,
+        records: &[nexus_identity::SignedRecord],
+        pin: &str,
+    ) -> Result<(), BrowserError> {
+        let chain = serde_json::to_vec(records)
+            .map_err(|e| BrowserError::Content(format!("bad records body: {e}")))?;
+        let records_id = self.blobs.put(&chain)?;
+        self.put_inner(site, path, page, Some(records_id), Some(pin.to_string()))
+    }
+
+    fn put_inner(
+        &self,
+        site: &str,
+        path: &str,
+        page: &Page,
+        records_id: Option<String>,
+        pin: Option<String>,
+    ) -> Result<(), BrowserError> {
         if !valid_key(site, path) {
             return Ok(());
         }
@@ -132,6 +177,8 @@ impl OfflineCache {
         let entry = Entry {
             content_id,
             fetched_at: now(),
+            records_id,
+            pin,
         };
         idx.pages.insert(key(site, path), entry);
         self.write_index(&idx)
@@ -159,6 +206,76 @@ impl OfflineCache {
                 self.remove(site, path);
                 None
             }
+        }
+    }
+
+    /// Verified lookup: like [`OfflineCache::lookup`], but the entry must
+    /// carry a record chain for exactly `pin`, and the chain must still
+    /// verify against the cached page right now (expiry included). Anything
+    /// less is a miss and evicts the entry — a stale chain must never
+    /// shadow a future honest fetch.
+    pub fn lookup_verified(&self, site: &str, path: &str, pin: &str) -> Option<Page> {
+        if !valid_key(site, path) {
+            return None;
+        }
+        let idx = self.read_index().ok()?;
+        let entry = idx.pages.get(&key(site, path))?;
+        if entry.pin.as_deref() != Some(pin) {
+            return None;
+        }
+        // Any chain failure evicts: a stale chain must never shadow a
+        // future honest fetch.
+        let records_id = entry.records_id.as_ref()?;
+        let chain_bytes = match self.blobs.get(records_id) {
+            Ok(b) => b,
+            Err(_) => {
+                self.remove(site, path);
+                return None;
+            }
+        };
+        let records: Vec<nexus_identity::SignedRecord> = match serde_json::from_slice(&chain_bytes)
+        {
+            Ok(r) => r,
+            Err(_) => {
+                self.remove(site, path);
+                return None;
+            }
+        };
+        let page = self.lookup(site, path)?;
+        if crate::verify_pinned(&page, pin, path, &records, now()).is_err() {
+            self.remove(site, path);
+            return None;
+        }
+        Some(page)
+    }
+
+    /// Fetch with pin verification and offline fallback. Fresh path stores
+    /// page + chain via [`OfflineCache::put_verified`]; transport failure
+    /// serves [`CacheStatus::StaleVerified`] from [`OfflineCache::lookup_verified`].
+    /// Non-transport errors (404, bad records, pin mismatch) are never shadowed.
+    pub fn fetch_verified(
+        &self,
+        endpoint: &str,
+        site: &str,
+        path: &str,
+        pin: &str,
+    ) -> Result<(Page, CacheStatus), BrowserError> {
+        let fresh = (|| {
+            let page = crate::fetch_page(endpoint, site, path)?;
+            let records = crate::fetch_records(endpoint, site, path)?;
+            if records.is_empty() {
+                return Err(BrowserError::PinRecordsRequired(pin.to_string()));
+            }
+            crate::verify_pinned(&page, pin, path, &records, now())?;
+            let _ = self.put_verified(site, path, &page, &records, pin);
+            Ok((page, CacheStatus::Fresh))
+        })();
+        match fresh {
+            Err(e @ BrowserError::Transport(nexus_transport::TransportError::Io(_))) => self
+                .lookup_verified(site, path, pin)
+                .map(|p| (p, CacheStatus::StaleVerified))
+                .ok_or(e),
+            other => other,
         }
     }
 
@@ -234,6 +351,32 @@ mod tests {
             .unwrap(); // invalid site: no-op
         assert!(c.lookup("Example", "home").is_none());
         assert!(!dir.join("index.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unverified_put_supersedes_verified_entry() {
+        // A pin must never be satisfiable by unpinned bytes: a plain `put`
+        // drops the chain, so verified lookup misses afterwards.
+        use nexus_identity::SiteIdentity;
+        let dir = temp_dir("supersede");
+        let c = OfflineCache::new(&dir);
+        let id = SiteIdentity::from_secret_bytes(&[41u8; 32]).unwrap();
+        let p = page("example", "home", 1);
+        let rec = id
+            .sign_record("home", &p.content_id().unwrap(), 9_999_999_999)
+            .unwrap();
+        c.put_verified("example", "home", &p, &[rec], &id.site_id())
+            .unwrap();
+        assert!(c
+            .lookup_verified("example", "home", &id.site_id())
+            .is_some());
+        c.put("example", "home", &p).unwrap();
+        assert!(c
+            .lookup_verified("example", "home", &id.site_id())
+            .is_none());
+        // ...but the plain lookup still serves (unverified path unaffected).
+        assert!(c.lookup("example", "home").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

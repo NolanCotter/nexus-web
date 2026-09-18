@@ -44,6 +44,97 @@ fn temp_dir(name: &str) -> PathBuf {
     d
 }
 
+/// Server that answers exactly two requests (RECORDS + FETCH, in the order
+/// verified fetches issue them), then dies. The store signs its page.
+fn serve_signed_twice(
+    bytes: Vec<u8>,
+    identity: &nexus_identity::SiteIdentity,
+) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let identity = identity.clone();
+    let handle = std::thread::spawn(move || {
+        let mut store = nexus_server::SiteStore::new();
+        store.insert("example", "home", bytes);
+        store.sign_pages(&identity, 9_999_999_999).unwrap();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            nexus_server::handle_one(&stream, &store).unwrap();
+        }
+    });
+    (addr, handle)
+}
+
+fn test_key(seed: u8) -> nexus_identity::SiteIdentity {
+    nexus_identity::SiteIdentity::from_secret_bytes(&[seed; 32]).unwrap()
+}
+
+#[test]
+fn pinned_offline_serves_verified_stale() {
+    let dir = temp_dir("verified-stale");
+    let cache = OfflineCache::new(&dir);
+    let id = test_key(31);
+    let (addr, server) = serve_signed_twice(page_bytes(1), &id);
+
+    let (page, status) = cache
+        .fetch_verified(&addr.to_string(), "example", "home", &id.site_id())
+        .unwrap();
+    assert!(matches!(status, CacheStatus::Fresh));
+    assert_eq!(page.metadata.revision, 1);
+
+    server.join().unwrap(); // server dead: port closed
+
+    let (page2, status2) = cache
+        .fetch_verified(&addr.to_string(), "example", "home", &id.site_id())
+        .unwrap();
+    assert!(matches!(status2, CacheStatus::StaleVerified));
+    assert_eq!(page2.to_canonical_json().unwrap(), page_bytes(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn verified_stale_rejects_wrong_pin_and_tamper() {
+    let dir = temp_dir("verified-pin");
+    let cache = OfflineCache::new(&dir);
+    let id = test_key(32);
+    let other = test_key(33);
+    let (addr, server) = serve_signed_twice(page_bytes(1), &id);
+    cache
+        .fetch_verified(&addr.to_string(), "example", "home", &id.site_id())
+        .unwrap();
+    server.join().unwrap();
+
+    // Wrong pin: no entry applies, transport error propagates.
+    let err = cache
+        .fetch_verified(&addr.to_string(), "example", "home", &other.site_id())
+        .unwrap_err();
+    assert!(matches!(err, BrowserError::Transport(_)));
+
+    // Tamper with the cached chain: verified lookup must miss + evict.
+    let idx: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("index.json")).unwrap()).unwrap();
+    let rid = idx["pages"]["example\u{1f}home"]["records_id"]
+        .as_str()
+        .unwrap();
+    let blob = dir.join("blobs").join(&rid[3..5]).join(&rid[5..]);
+    let mut bad = std::fs::read(&blob).unwrap();
+    // Length-preserving flip inside the JSON (keeps the blob length, breaks
+    // the signature over the content hash).
+    let mid = bad.len() / 2;
+    bad[mid] ^= 0xff;
+    std::fs::write(&blob, bad).unwrap();
+    // NOTE: flipping may break JSON parsing or the signature; either way
+    // the entry must not serve. (BLAKE3 catches it first → miss + evict.)
+    let err = cache
+        .fetch_verified(&addr.to_string(), "example", "home", &id.site_id())
+        .unwrap_err();
+    assert!(matches!(err, BrowserError::Transport(_)));
+    let idx: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("index.json")).unwrap()).unwrap();
+    assert!(idx["pages"].get("example\u{1f}home").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn offline_fetch_returns_stale_after_server_dies() {
     let dir = temp_dir("stale");

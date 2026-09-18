@@ -1,4 +1,4 @@
-use nexus_browser::{navigate_cached, navigate_verified, CacheStatus, OfflineCache};
+use nexus_browser::{navigate_cached, navigate_cached_verified, CacheStatus, OfflineCache};
 use nexus_resolver::{LocalResolver, Route};
 
 fn usage() -> &'static str {
@@ -63,25 +63,24 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Pinned fetches go direct over the wire (RECORDS + verify) and never
-    // touch the offline cache: cached pages carry no provenance, so mixing
-    // them with pin verification needs its own design (future work).
-    if pin.is_some() {
-        match navigate_verified(&resolver, &site, &path) {
-            Ok(page) => print!("{}", nexus_renderer::render_text(&page)),
-            Err(e) => {
-                eprintln!("verified fetch {site}/{path} from {server}: {e}");
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-
+    // Pinned fetches verify against the record chain and fall back to the
+    // verified cache offline; unpinned fetches use the plain cache path.
+    // (The two paths share one index: an unverified `put` supersedes a
+    // verified entry, so a pin can never be satisfied by unpinned bytes.)
     let cache = OfflineCache::open_default();
-    match navigate_cached(&resolver, &cache, &site, &path) {
+    let result = if pin.is_some() {
+        navigate_cached_verified(&resolver, &cache, &site, &path)
+    } else {
+        navigate_cached(&resolver, &cache, &site, &path)
+    };
+    match result {
         Ok((page, status)) => {
-            if let CacheStatus::Stale = status {
-                println!("[STALE (offline)] served from local cache");
+            match status {
+                CacheStatus::Fresh => {}
+                CacheStatus::Stale => println!("[STALE (offline)] served from local cache"),
+                CacheStatus::StaleVerified => {
+                    println!("[STALE VERIFIED (offline)] served from local cache")
+                }
             }
             print!("{}", nexus_renderer::render_text(&page));
         }

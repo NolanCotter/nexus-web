@@ -39,7 +39,8 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #35 verified sessions: ClientSession pinning + `nexus browse --pin` interactive verified nav
 - [x] #36 background record refresh: re-signer thread + --resign-interval, no restart
 - [x] #37 full-screen TUI browser (`nexus-tui`): testable state machine + ratatui shell, verified-fetch aware
-- Next: DHT past gates, record refresh already done, WebVM execution.
+- [x] #38 verified offline cache: pinned chains cached + re-verified stale serve (`--pin` works offline)
+- Next: DHT past gates, WebVM execution.
 
 ## Notes (wave 2, 2026-09-17)
 - `cargo test --workspace`: 141+ passed, 0 failed. `cargo fmt --check`: clean.

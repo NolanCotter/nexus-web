@@ -347,7 +347,7 @@ fn now_unix() -> u64 {
 
 /// Fail-closed pin check: at least one record must vouch that the canonical
 /// content id of `page` is what `pinned_site_id` signed for `path`.
-fn verify_pinned(
+pub(crate) fn verify_pinned(
     page: &Page,
     pinned_site_id: &str,
     path: &str,
@@ -447,6 +447,27 @@ pub fn navigate_cached(
         .first()
         .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
     cache.fetch(endpoint, site, path)
+}
+
+/// Resolve `site`, then fetch `path` verified against the route pin with
+/// offline fallback. Routes without a pin behave exactly like
+/// [`navigate_cached`]; pinned routes store and serve the record chain
+/// through the cache (`Fresh` / [`CacheStatus::StaleVerified`]).
+pub fn navigate_cached_verified(
+    resolver: &LocalResolver,
+    cache: &OfflineCache,
+    site: &str,
+    path: &str,
+) -> Result<(Page, CacheStatus), BrowserError> {
+    let route = resolver.resolve(site)?;
+    let endpoint = route
+        .endpoints
+        .first()
+        .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
+    match route.pinned_site_id.clone() {
+        None => cache.fetch(endpoint, site, path),
+        Some(pin) => cache.fetch_verified(endpoint, site, path, &pin),
+    }
 }
 
 #[cfg(test)]
