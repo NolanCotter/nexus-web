@@ -15,6 +15,7 @@ fn usage() -> &'static str {
       nexus browse <site[/path]> [--server HOST:PORT] [--pin SITE_ID]\n\
       nexus sync --server HOST:PORT --site NAME --dir PATH [--pin SITE_ID]\n\
       nexus cache-gc [--dir PATH]\n\
+      nexus history\n\
      \n\
      commands at the prompt:\n\
        b | back       go back in history\n\
@@ -231,6 +232,73 @@ fn cmd_cache_gc(args: &[String]) -> i32 {
     0
 }
 
+/// Cross-session visit log: same `$NEXUS_CACHE_DIR/history.json` file the
+/// TUI writes ([`tui::HistoryVisit`] rows), so both browsers share recall.
+/// Writes are best-effort and atomic; corrupt files read back as empty.
+fn history_path() -> std::path::PathBuf {
+    nexus_browser::OfflineCache::default_dir().join("history.json")
+}
+
+fn read_visit_log(path: &std::path::Path) -> Vec<nexus_browser::tui::HistoryVisit> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<nexus_browser::tui::HistoryVisit> =
+        serde_json::from_slice(&bytes).unwrap_or_default();
+    entries.retain(|v| {
+        nexus_protocol::is_valid_site(&v.site) && nexus_protocol::is_valid_path(&v.path)
+    });
+    if entries.len() > nexus_browser::tui::HISTORY_MAX_ENTRIES {
+        entries.drain(..entries.len() - nexus_browser::tui::HISTORY_MAX_ENTRIES);
+    }
+    entries
+}
+
+fn record_visit_to(path: &std::path::Path, site: &str, visit_path: &str) -> Result<(), String> {
+    if !nexus_protocol::is_valid_site(site) || !nexus_protocol::is_valid_path(visit_path) {
+        return Ok(());
+    }
+    let mut entries = read_visit_log(path);
+    if entries
+        .last()
+        .is_some_and(|v| v.site == site && v.path == visit_path)
+    {
+        return Ok(());
+    }
+    entries.push(nexus_browser::tui::HistoryVisit {
+        site: site.into(),
+        path: visit_path.into(),
+    });
+    if entries.len() > nexus_browser::tui::HISTORY_MAX_ENTRIES {
+        entries.drain(..entries.len() - nexus_browser::tui::HISTORY_MAX_ENTRIES);
+    }
+    let bytes = serde_json::to_vec(&entries).map_err(|e| e.to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn record_visit(site: &str, visit_path: &str) {
+    let _ = record_visit_to(&history_path(), site, visit_path);
+}
+
+/// Print the cross-session visit log, most recent last.
+fn cmd_history() -> i32 {
+    let entries = read_visit_log(&history_path());
+    if entries.is_empty() {
+        println!("(no visits recorded yet)");
+        return 0;
+    }
+    for (i, v) in entries.iter().enumerate() {
+        println!("{}. @{} /{}", i + 1, v.site, v.path);
+    }
+    0
+}
+
 fn render(session: &ClientSession) {
     if let Some(v) = session.history.current() {
         println!(
@@ -260,6 +328,10 @@ fn print_history(session: &ClientSession) {
 }
 
 fn run_nav(session: &mut ClientSession, cmd: Command) {
+    let target = match &cmd {
+        Command::Open(t) => Some(t.clone()),
+        _ => None,
+    };
     let res = match cmd {
         Command::Back => session.back(),
         Command::Forward => session.forward(),
@@ -268,7 +340,15 @@ fn run_nav(session: &mut ClientSession, cmd: Command) {
         _ => return,
     };
     match res {
-        Ok(()) => render(session),
+        Ok(()) => {
+            // Record successful opens for cross-session `nexus history`.
+            if let Some(t) = target {
+                if let Ok((site, path)) = nexus_browser::parse_target(&t) {
+                    record_visit(&site, &path);
+                }
+            }
+            render(session)
+        }
         Err(e) => eprintln!("nexus: {e}"),
     }
 }
@@ -302,6 +382,9 @@ fn main() {
     if args.first().is_some_and(|a| a == "cache-gc") {
         std::process::exit(cmd_cache_gc(&args));
     }
+    if args.first().is_some_and(|a| a == "history") {
+        std::process::exit(cmd_history());
+    }
     let (server, target, pin) = match parse_args(&args) {
         Ok(t) => t,
         Err(code) => std::process::exit(code),
@@ -315,6 +398,9 @@ fn main() {
     if let Err(e) = session.open(&target) {
         eprintln!("nexus: {target}: {e}");
         std::process::exit(1);
+    }
+    if let Ok((site, path)) = nexus_browser::parse_target(&target) {
+        record_visit(&site, &path);
     }
     render(&session);
     interactive(&mut session);
@@ -394,6 +480,27 @@ mod tests {
         assert_eq!(parse_args(&["--nope".into()]), Err(2));
         assert_eq!(parse_args(&["--help".into()]), Err(0));
         assert_eq!(parse_args(&["browse".into(), "--pin".into()]), Err(2));
+    }
+
+    #[test]
+    fn visit_log_roundtrip_caps_and_corrupt() {
+        let dir = std::env::temp_dir().join(format!("nexus-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("history.json");
+        assert!(read_visit_log(&file).is_empty());
+        record_visit_to(&file, "example", "home").unwrap();
+        record_visit_to(&file, "example", "home").unwrap(); // dupe collapses
+        record_visit_to(&file, "EXAMPLE", "home").unwrap(); // invalid: ignored
+        assert_eq!(read_visit_log(&file).len(), 1);
+        for i in 0..(nexus_browser::tui::HISTORY_MAX_ENTRIES + 10) {
+            record_visit_to(&file, "example", &format!("p{i}")).unwrap();
+        }
+        let entries = read_visit_log(&file);
+        assert_eq!(entries.len(), nexus_browser::tui::HISTORY_MAX_ENTRIES);
+        assert_eq!(entries.last().unwrap().path, "p109");
+        std::fs::write(&file, b"{corrupt").unwrap();
+        assert!(read_visit_log(&file).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

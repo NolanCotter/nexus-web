@@ -44,6 +44,7 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #40 demo covers signed flow: keyed server, pin accept/refuse, verified sync
 - [x] #41 cache GC: orphan/tmp reaping + `nexus cache-gc` (foreign files untouched)
 - [x] #42 TUI polish: history persistence, find-in-page, help overlay
+- [x] #43 cross-session `nexus history` shared with the TUI log
 - Next: DHT past gates, WebVM execution.
 
 ## Notes (wave 2, 2026-09-17)
