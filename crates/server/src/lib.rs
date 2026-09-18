@@ -34,10 +34,12 @@ pub enum ServerError {
     Content(String),
 }
 
-/// In-memory map of (site, path) to canonical page bytes served over NXP.
+/// In-memory map of (site, path) to canonical page bytes served over NXP,
+/// plus the signed records that vouch for them (`RECORDS` verb).
 #[derive(Debug, Default, Clone)]
 pub struct SiteStore {
     pages: HashMap<(String, String), Vec<u8>>,
+    records: HashMap<(String, String), Vec<u8>>,
 }
 
 impl SiteStore {
@@ -58,6 +60,44 @@ impl SiteStore {
         self.pages
             .get(&(site.to_string(), path.to_string()))
             .map(Vec::as_slice)
+    }
+
+    /// Look up the signed-records JSON array for (site, path), if any.
+    pub fn get_records(&self, site: &str, path: &str) -> Option<&[u8]> {
+        self.records
+            .get(&(site.to_string(), path.to_string()))
+            .map(Vec::as_slice)
+    }
+
+    /// Sign every stored page with `identity` and publish one
+    /// [`SignedRecord`](nexus_identity::SignedRecord) per (site, path),
+    /// expiring at `expires_at_unix`. Returns the number of records
+    /// published. Replaces any previous records for those routes.
+    pub fn sign_pages(
+        &mut self,
+        identity: &nexus_identity::SiteIdentity,
+        expires_at_unix: u64,
+    ) -> Result<usize, ServerError> {
+        // Collect first so a mid-loop failure cannot leave a half-signed store.
+        let mut signed = Vec::new();
+        for ((site, path), bytes) in &self.pages {
+            let page = nexus_content::Page::from_json(bytes)
+                .map_err(|e| ServerError::Content(e.to_string()))?;
+            let content_id = page
+                .content_id()
+                .map_err(|e| ServerError::Content(e.to_string()))?;
+            let record = identity
+                .sign_record(path, &content_id, expires_at_unix)
+                .map_err(|e| ServerError::Content(e.to_string()))?;
+            let body =
+                serde_json::to_vec(&[record]).map_err(|e| ServerError::Content(e.to_string()))?;
+            signed.push(((site.clone(), path.clone()), body));
+        }
+        let count = signed.len();
+        for (route, body) in signed {
+            self.records.insert(route, body);
+        }
+        Ok(count)
     }
 
     /// Load every `*.json` file in `dir` as path = file stem for `site`.
@@ -135,10 +175,19 @@ impl Default for ServerConfig {
 pub fn handle_one(stream: &std::net::TcpStream, store: &SiteStore) -> Result<(), ServerError> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let line = nexus_transport::read_line_limited(&mut reader)?;
+    // FETCH and RECORDS share the line shape; dispatch on verb. Anything
+    // else (including malformed lines) is a 400 — never a panic.
     let response = match nxp::parse_request(&line) {
         Ok(req) => match store.get(&req.site, &req.path) {
             Some(body) => nxp::encode_response(200, body)?,
             None => nxp::encode_response(404, b"not found")?,
+        },
+        Err(nxp::ProtocolError::BadVerb(_)) => match nxp::parse_records_request(&line) {
+            Ok(req) => match store.get_records(&req.site, &req.path) {
+                Some(body) => nxp::encode_response(200, body)?,
+                None => nxp::encode_response(404, b"no records")?,
+            },
+            Err(_) => nxp::encode_response(400, b"bad request")?,
         },
         Err(_) => nxp::encode_response(400, b"bad request")?,
     };
@@ -280,6 +329,72 @@ mod tests {
         };
         let (code, _) = nexus_transport::fetch(addr, &req).unwrap();
         assert_eq!(code, 404);
+    }
+
+    #[test]
+    fn records_roundtrip_over_tcp() {
+        use nexus_identity::SiteIdentity;
+        let id = SiteIdentity::generate();
+        let mut store = SiteStore::new();
+        store.insert("example", "home", page_bytes("example", "home"));
+        let n = store.sign_pages(&id, 9_999_999_999).unwrap();
+        assert_eq!(n, 1);
+        let page = nexus_content::Page::from_json(store.get("example", "home").unwrap()).unwrap();
+        let want = page.content_id().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_one(&stream, &store).unwrap();
+        });
+        let line = nxp::encode_records_request(&nxp::RecordsRequest {
+            site: "example".into(),
+            path: "home".into(),
+        })
+        .unwrap();
+        let (code, body) = nexus_transport::fetch_raw(addr, &line).unwrap();
+        assert_eq!(code, 200);
+        let records: Vec<nexus_identity::SignedRecord> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(records.len(), 1);
+        // The served record verifies and vouches for the served page.
+        id.verify_record(&records[0], 1_000_000).unwrap();
+        assert_eq!(records[0].record.content_hash, want);
+    }
+
+    #[test]
+    fn records_missing_without_key() {
+        // A store that never signed has no records: 404, not 400.
+        let mut store = SiteStore::new();
+        store.insert("example", "home", page_bytes("example", "home"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_one(&stream, &store).unwrap();
+        });
+        let line = nxp::encode_records_request(&nxp::RecordsRequest {
+            site: "example".into(),
+            path: "home".into(),
+        })
+        .unwrap();
+        let (code, _) = nexus_transport::fetch_raw(addr, &line).unwrap();
+        assert_eq!(code, 404);
+    }
+
+    #[test]
+    fn unknown_verb_still_400() {
+        use std::io::Write;
+        let store = SiteStore::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_one(&stream, &store).unwrap();
+        });
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.write_all(b"NXP/0.1 DELETE example home\n").unwrap();
+        let (code, _) = read_response(&s);
+        assert_eq!(code, 400);
     }
 
     fn read_response(stream: &std::net::TcpStream) -> (u16, Vec<u8>) {
