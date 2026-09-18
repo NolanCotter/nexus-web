@@ -1,0 +1,15 @@
+[package]
+name = "dht-spike"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kademlia spike: k-bucket routing + churn/sybil simulation wired to nexus-resolver verification. EXPERIMENT ONLY."
+
+[dependencies]
+nexus-resolver = { path = "../resolver" }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hex = "0.4"
+blake3 = "1"
+
+[lints]
+workspace = true

@@ -230,6 +230,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dht-spike"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "hex",
+ "nexus-resolver",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

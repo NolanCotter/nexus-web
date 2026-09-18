@@ -4,6 +4,7 @@ members = [
   "crates/protocol",
   "crates/identity",
   "crates/resolver",
+  "crates/dht-spike",
   "crates/transport",
   "crates/content",
   "crates/storage",
