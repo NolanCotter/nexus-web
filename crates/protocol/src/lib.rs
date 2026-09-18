@@ -3,6 +3,7 @@
 //! Text request lines over TCP (prototype, not final):
 //!   `NXP/0.1 FETCH <site> <path>\n` — fetch a page body
 //!   `NXP/0.1 RECORDS <site> <path>\n` — fetch signed records for a page
+//!   `NXP/0.1 LIST <site>\n` — list a site's paths as a JSON array
 //! Response:
 //!   `NXP/0.1 <CODE> <LEN>\n<body bytes>`
 //!
@@ -39,6 +40,14 @@ pub struct RecordsRequest {
     pub site: String,
     /// Content path, no leading slash (see [`is_valid_path`]).
     pub path: String,
+}
+
+/// A parsed `LIST` request: enumerate a site's paths. Three tokens
+/// (`version verb site`), no path — the odd one out, parsed separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListRequest {
+    /// Lowercase site name (see [`is_valid_site`]).
+    pub site: String,
 }
 
 /// A parsed response header: status code plus the exact body length.
@@ -135,6 +144,15 @@ pub fn encode_records_request(req: &RecordsRequest) -> Result<String, ProtocolEr
     encode_request_line("RECORDS", &req.site, &req.path)
 }
 
+/// Encode a `LIST` request (`NXP/0.1 LIST <site>\n`). No path: anything
+/// after the site token is rejected.
+pub fn encode_list_request(req: &ListRequest) -> Result<String, ProtocolError> {
+    if !is_valid_site(&req.site) {
+        return Err(ProtocolError::BadSite(req.site.clone()));
+    }
+    Ok(format!("{VERSION} LIST {}\n", req.site))
+}
+
 fn encode_request_line(verb: &str, site: &str, path: &str) -> Result<String, ProtocolError> {
     if !is_valid_site(site) {
         return Err(ProtocolError::BadSite(site.to_string()));
@@ -152,6 +170,7 @@ pub fn parse_request(line: &str) -> Result<FetchRequest, ProtocolError> {
     if verb != "FETCH" {
         return Err(ProtocolError::BadVerb(verb));
     }
+    check_site_path(&site, &path, line)?;
     Ok(FetchRequest { site, path })
 }
 
@@ -162,7 +181,40 @@ pub fn parse_records_request(line: &str) -> Result<RecordsRequest, ProtocolError
     if verb != "RECORDS" {
         return Err(ProtocolError::BadVerb(verb));
     }
+    check_site_path(&site, &path, line)?;
     Ok(RecordsRequest { site, path })
+}
+
+/// Parse one `LIST` request line (untrusted input): exactly three
+/// space-separated tokens, valid site, nothing trailing.
+pub fn parse_list_request(line: &str) -> Result<ListRequest, ProtocolError> {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.is_empty() {
+        return Err(ProtocolError::Empty);
+    }
+    if line.len() > MAX_LINE {
+        return Err(ProtocolError::LineTooLong);
+    }
+    let mut parts = line.splitn(3, ' ');
+    let version = parts.next().unwrap_or("");
+    let verb = parts.next().unwrap_or("");
+    let site = parts.next().unwrap_or("");
+    if version != VERSION {
+        return Err(ProtocolError::BadVersion(version.to_string()));
+    }
+    if verb != "LIST" {
+        return Err(ProtocolError::BadVerb(verb.to_string()));
+    }
+    if !is_valid_site(site) {
+        return Err(ProtocolError::BadSite(site.to_string()));
+    }
+    if site.is_empty() || site.contains(' ') {
+        return Err(ProtocolError::Malformed(line.to_string()));
+    }
+    Ok(ListRequest {
+        site: site.to_string(),
+    })
 }
 
 fn split_request_line(line: &str) -> Result<(String, String, String), ProtocolError> {
@@ -182,6 +234,13 @@ fn split_request_line(line: &str) -> Result<(String, String, String), ProtocolEr
     if version != VERSION {
         return Err(ProtocolError::BadVersion(version.to_string()));
     }
+    Ok((verb.to_string(), site.to_string(), path.to_string()))
+}
+
+/// Shared site/path validation plus trailing-token rejection for the
+/// four-token verbs (FETCH, RECORDS). Runs *after* the verb check so a
+/// wrong verb always reports [`ProtocolError::BadVerb`].
+fn check_site_path(site: &str, path: &str, line: &str) -> Result<(), ProtocolError> {
     if !is_valid_site(site) {
         return Err(ProtocolError::BadSite(site.to_string()));
     }
@@ -193,7 +252,7 @@ fn split_request_line(line: &str) -> Result<(String, String, String), ProtocolEr
     if site.is_empty() || path.is_empty() || path.contains(' ') {
         return Err(ProtocolError::Malformed(line.to_string()));
     }
-    Ok((verb.to_string(), site.to_string(), path.to_string()))
+    Ok(())
 }
 
 /// Encode a full response frame (header line + body). Rejects oversize
@@ -305,6 +364,42 @@ mod tests {
             parse_request("NXP/0.1 RECORDS example home\n"),
             Err(ProtocolError::BadVerb(_))
         ));
+        // LIST is a different shape: no path accepted or required.
+        assert!(matches!(
+            parse_request("NXP/0.1 LIST example\n"),
+            Err(ProtocolError::BadVerb(_))
+        ));
+        assert!(matches!(
+            parse_list_request("NXP/0.1 LIST example extra\n"),
+            Err(ProtocolError::BadSite(_))
+        ));
+    }
+
+    #[test]
+    fn roundtrip_list_request() {
+        let req = ListRequest {
+            site: "example".into(),
+        };
+        let line = encode_list_request(&req).unwrap();
+        assert_eq!(line, "NXP/0.1 LIST example\n");
+        assert_eq!(parse_list_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn list_rejects_bad_input() {
+        assert!(matches!(
+            parse_list_request("NXP/0.1 LIST Example\n"),
+            Err(ProtocolError::BadSite(_))
+        ));
+        assert!(matches!(
+            parse_list_request("NXP/0.1 LIST\n"),
+            Err(ProtocolError::BadSite(_))
+        ));
+        assert!(matches!(
+            parse_list_request("NXP/0.1 FETCH example\n"),
+            Err(ProtocolError::BadVerb(_))
+        ));
+        assert!(encode_list_request(&ListRequest { site: "".into() }).is_err());
     }
 
     #[test]
