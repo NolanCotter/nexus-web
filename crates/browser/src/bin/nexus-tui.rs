@@ -14,9 +14,9 @@ use nexus_browser::tui::{KeyAction, TuiState};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Terminal,
 };
 use std::io;
@@ -90,9 +90,27 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &TuiState)
         let viewport_h = chunks[1].height as usize;
         let (start, end) = state.visible_range(viewport_h);
         let lines = state.page_lines();
+        let hits = state.find_matches().to_vec();
+        let current = state.current_match_line();
         let body: Vec<Line> = lines[start..end.min(lines.len())]
             .iter()
-            .map(|l| Line::from(l.as_str()))
+            .enumerate()
+            .map(|(k, l)| {
+                let idx = start + k;
+                if Some(idx) == current {
+                    Line::from(Span::styled(
+                        l.as_str(),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                } else if hits.contains(&idx) {
+                    Line::from(Span::styled(l.as_str(), Style::default().fg(Color::Yellow)))
+                } else {
+                    Line::from(l.as_str())
+                }
+            })
             .collect();
         frame.render_widget(
             Paragraph::new(body)
@@ -110,26 +128,66 @@ fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, state: &TuiState)
         } else {
             Span::styled(" UNVERIFIED", Style::default().fg(Color::Yellow))
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::raw("> "),
-                Span::raw(state.input()),
-                Span::styled("▌", Style::default().fg(Color::Gray)),
-            ]))
-            .block(Block::default().borders(Borders::ALL).title("address")),
-            chunks[0],
-        );
+        if state.is_finding() {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(format!("/{}", state.find_query())),
+                    Span::styled("▌", Style::default().fg(Color::Gray)),
+                ]))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("find (Enter confirms, Esc cancels)"),
+                ),
+                chunks[0],
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw("> "),
+                    Span::raw(state.input()),
+                    Span::styled("▌", Style::default().fg(Color::Gray)),
+                ]))
+                .block(Block::default().borders(Borders::ALL).title("address")),
+                chunks[0],
+            );
+        }
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::raw(state.status()),
                 pin_tag,
-                Span::raw("  (b/f back/forward, r reload, q quit)"),
+                Span::raw("  (b/f back/fwd, r reload, / find, ? keys, q quit)"),
             ]))
             .block(Block::default().borders(Borders::ALL)),
             chunks[2],
         );
+
+        if state.help_visible() {
+            let popup = centered_popup(area, 54, TuiState::help_lines().len() as u16 + 2);
+            frame.render_widget(Clear, popup);
+            frame.render_widget(
+                Paragraph::new(TuiState::help_lines().join("\n")).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("keys (?/Esc closes)"),
+                ),
+                popup,
+            );
+        }
     })?;
     Ok(())
+}
+
+/// Fixed-size rect centered in `area` (clamped to fit tiny terminals).
+fn centered_popup(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
+    let w = width.min(area.width.saturating_sub(2)).max(1);
+    let h = height.min(area.height.saturating_sub(2)).max(1);
+    ratatui::layout::Rect::new(
+        area.x + area.width.saturating_sub(w) / 2,
+        area.y + area.height.saturating_sub(h) / 2,
+        w,
+        h,
+    )
 }
 
 fn run(server: String, pin: Option<String>, target: Option<String>) -> io::Result<()> {
@@ -140,8 +198,10 @@ fn run(server: String, pin: Option<String>, target: Option<String>) -> io::Resul
     let mut terminal = Terminal::new(backend)?;
 
     let mut state = TuiState::new(server, pin);
+    state.load_history();
     if let Some(t) = target {
         state.open(&t);
+        state.save_history();
     }
 
     loop {
@@ -152,14 +212,21 @@ fn run(server: String, pin: Option<String>, target: Option<String>) -> io::Resul
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
                 {
+                    state.save_history();
                     KeyAction::Quit
                 } else {
-                    state.handle_key(key.code)
+                    let opened = matches!(key.code, KeyCode::Enter);
+                    let action = state.handle_key(key.code);
+                    if opened {
+                        state.save_history();
+                    }
+                    action
                 }
             }
             _ => KeyAction::Continue,
         };
         if action == KeyAction::Quit {
+            state.save_history();
             break;
         }
         // Clamp scroll after navigation changed the page.
