@@ -59,23 +59,79 @@ pub trait Backend: Debug + Send + Sync {
 
 /// ## v1 — Federated resolver backend (the only networked backend)
 ///
-/// Query: `GET /resolve/{name}` → JSON list of [`SignedRecord`] envelopes.
-/// Empty 204 = authoritative "nothing here". Answers are verified at the
-/// resolver-core boundary: a malicious resolver can *withhold* data but can
-/// never forge it.
+/// Pull-only, DNS-like: `fetch(name)` sends one `RECORDS` request per
+/// configured endpoint over nexus-transport TCP framing and returns the raw
+/// [`SignedRecord`] envelopes the servers answered with, aggregated across
+/// endpoints. Shared wire convention: `docs/decisions/010-federated-records-convention.md`.
 ///
-/// Trust: resolvers are availability points, not authorities. Configure
-/// several; the core's merge rule (newest verified wins) reconciles them.
+/// Trust: resolvers are availability points, not authorities. This backend
+/// is a pure transport — it moves envelopes and keeps transport counters,
+/// but NEVER verifies, merges, or decides policy. Everything it returns is
+/// admitted (or dropped) through the exact same core path as
+/// [`MemoryBackend`]: signature + site match + expiry + strictly-advancing
+/// seq against the out-of-band trust anchor in the resolver's store. A
+/// malicious resolver can *withhold* data (serve 404/empty) but can never
+/// forge it. Configure several; aggregation plus the core's merge rule
+/// (newest verified wins) reconciles them.
+///
+/// Publish is out-of-band: NXP/0.1 has no push verb, so `advertise` stays
+/// the default best-effort no-op; records are signed and published at the
+/// resolver itself.
 #[derive(Debug)]
 pub struct FederatedBackend {
-    /// Resolver base URLs, queried in order.
+    /// Resolver endpoints as `host:port`, queried in order and aggregated.
     pub endpoints: Vec<String>,
+    /// Transport observability: raw wire outcomes, never admission decisions.
+    stats: std::sync::Mutex<BackendStats>,
+}
+
+/// Transport-level counters for [`FederatedBackend`] queries. They describe
+/// what the wire did, never what the verified store admitted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BackendStats {
+    /// RECORDS requests sent.
+    pub requests: u64,
+    /// Envelopes returned by servers (pre-verification).
+    pub records: u64,
+    /// Transport/decode failures (unreachable, malformed, refused).
+    pub failures: u64,
+    /// Status code of the last response seen (0 = none).
+    pub last_code: u16,
+}
+
+/// One RECORDS round-trip against a single endpoint. Line shape:
+/// `NXP/0.1 RECORDS <name> @<name>\n` — the path is the `@name`
+/// endpoint-record namespace the resolver core keys on (010 decision).
+/// `name` already passed `is_valid_site` at the caller, so the interpolated
+/// line can carry no injection bytes.
+fn query(endpoint: &str, name: &str) -> Result<(u16, Vec<SignedRecord>), BackendError> {
+    let line = format!("{} RECORDS {name} @{name}\n", nexus_protocol::VERSION);
+    let (code, body) = nexus_transport::fetch_raw(endpoint, &line)
+        .map_err(|e| BackendError::Unreachable(e.to_string()))?;
+    if code != 200 {
+        return if code == 404 {
+            Ok((404, Vec::new())) // authoritative "nothing here"
+        } else {
+            Err(BackendError::Refused(format!("server answered {code}")))
+        };
+    }
+    serde_json::from_slice::<Vec<SignedRecord>>(&body)
+        .map(|records| (200, records))
+        .map_err(|_| BackendError::Malformed)
 }
 
 impl FederatedBackend {
-    /// Construct from resolver base URLs ("https://resolver.example").
+    /// Construct from resolver endpoints as `host:port` TCP addresses.
     pub fn new(endpoints: Vec<String>) -> Self {
-        Self { endpoints }
+        Self {
+            endpoints,
+            stats: std::sync::Mutex::new(BackendStats::default()),
+        }
+    }
+
+    /// Snapshot of the transport counters (logs, tests).
+    pub fn stats(&self) -> BackendStats {
+        crate::lock_ignoring_poison(&self.stats).clone()
     }
 }
 
@@ -84,9 +140,24 @@ impl Backend for FederatedBackend {
         "federated"
     }
 
-    fn fetch(&self, _name: &str) -> Vec<SignedRecord> {
-        // v1: HTTP/QUIC fetch per endpoint, JSON-decode envelopes, return raw.
-        Vec::new()
+    fn fetch(&self, name: &str) -> Vec<SignedRecord> {
+        if !crate::is_valid_name(name) {
+            return Vec::new(); // the core rejects invalid names anyway
+        }
+        let mut stats = crate::lock_ignoring_poison(&self.stats);
+        let mut out = Vec::new();
+        for endpoint in &self.endpoints {
+            stats.requests += 1;
+            match query(endpoint, name) {
+                Ok((code, mut records)) => {
+                    stats.last_code = code;
+                    stats.records += records.len() as u64;
+                    out.append(&mut records);
+                }
+                Err(_) => stats.failures += 1, // availability over single answers
+            }
+        }
+        out
     }
 }
 
