@@ -4,7 +4,14 @@ use std::path::PathBuf;
 use nexus_server::{ServerConfig, SiteStore};
 
 fn usage() -> &'static str {
-    "usage: nexus-server [--port PORT] [--site NAME] [--dir PATH] [--max-connections N]"
+    "usage: nexus-server [--port PORT] [--site NAME] [--dir PATH] [--max-connections N] [--key PATH] [--record-ttl SECS]"
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn main() {
@@ -12,6 +19,8 @@ fn main() {
     let mut site = "example".to_string();
     let mut dir = PathBuf::from("sites/example");
     let mut config = ServerConfig::default();
+    let mut key_path: Option<PathBuf> = None;
+    let mut record_ttl: u64 = 86400;
 
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
@@ -44,6 +53,18 @@ fn main() {
                         std::process::exit(2);
                     })
             }
+            "--key" => {
+                key_path = Some(PathBuf::from(args.next().unwrap_or_else(|| {
+                    eprintln!("{}", usage());
+                    std::process::exit(2);
+                })));
+            }
+            "--record-ttl" => {
+                record_ttl = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("{}", usage());
+                    std::process::exit(2);
+                })
+            }
             "--help" | "-h" => {
                 println!("{}", usage());
                 return;
@@ -68,6 +89,33 @@ fn main() {
     }
     for (s, p) in store.routes() {
         eprintln!("  route: {s}/{p}");
+    }
+
+    // Optional identity: with --key, every page is signed at startup and
+    // served over RECORDS. Missing key file is generated (0600); without
+    // --key the server serves pages only and RECORDS answers 404.
+    if let Some(path) = key_path {
+        let identity = if path.exists() {
+            nexus_identity::SiteIdentity::load_secret_key(&path).unwrap_or_else(|e| {
+                eprintln!("load key {}: {e}", path.display());
+                std::process::exit(1);
+            })
+        } else {
+            let id = nexus_identity::SiteIdentity::generate_key_file(&path).unwrap_or_else(|e| {
+                eprintln!("generate key {}: {e}", path.display());
+                std::process::exit(1);
+            });
+            eprintln!("generated new site key at {}", path.display());
+            id
+        };
+        eprintln!("site identity: {}", identity.site_id());
+        match store.sign_pages(&identity, now_unix().saturating_add(record_ttl)) {
+            Ok(n) => eprintln!("signed {n} record(s), ttl {record_ttl}s"),
+            Err(e) => {
+                eprintln!("sign pages: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|e| {
