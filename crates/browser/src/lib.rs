@@ -4,6 +4,7 @@
 //! [`cache`] adds the offline-first disk page cache (Milestone G).
 
 pub mod cache;
+pub mod tui;
 
 pub use cache::{CacheStatus, OfflineCache};
 
@@ -201,6 +202,11 @@ impl ClientSession {
     pub fn with_pin(mut self, pin: Option<String>) -> Self {
         self.pin = pin;
         self
+    }
+
+    /// The pinned site id, if this session verifies fetches.
+    pub fn pin(&self) -> Option<&str> {
+        self.pin.as_deref()
     }
 
     fn route(&mut self, site: &str) -> Result<Route, BrowserError> {
