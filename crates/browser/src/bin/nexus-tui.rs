@@ -27,6 +27,7 @@ fn usage() -> &'static str {
     "usage: nexus-tui [--server HOST:PORT] [--pin SITE_ID] [site[/path]]"
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct Args {
     server: String,
     pin: Option<String>,
