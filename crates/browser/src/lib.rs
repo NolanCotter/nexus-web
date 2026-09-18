@@ -182,6 +182,7 @@ pub fn parse_target(target: &str) -> Result<(String, String), BrowserError> {
 pub struct ClientSession {
     resolver: LocalResolver,
     server: String,
+    pin: Option<String>,
     pub history: History,
 }
 
@@ -190,8 +191,16 @@ impl ClientSession {
         Self {
             resolver: LocalResolver::new(),
             server: server.into(),
+            pin: None,
             history: History::new(),
         }
+    }
+
+    /// Pin all lazily-created routes to `site_id`: every fetch then goes
+    /// through `RECORDS` verification and fails closed without a chain.
+    pub fn with_pin(mut self, pin: Option<String>) -> Self {
+        self.pin = pin;
+        self
     }
 
     fn route(&mut self, site: &str) -> Result<Route, BrowserError> {
@@ -203,7 +212,7 @@ impl ClientSession {
                 site,
                 Route {
                     endpoints: vec![self.server.clone()],
-                    pinned_site_id: None,
+                    pinned_site_id: self.pin.clone(),
                 },
             )?;
         }
@@ -216,7 +225,16 @@ impl ClientSession {
             .endpoints
             .first()
             .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
-        fetch_page(endpoint, site, path)
+        let Some(pinned) = route.pinned_site_id.clone() else {
+            return fetch_page(endpoint, site, path);
+        };
+        let records = fetch_records(endpoint, site, path)?;
+        if records.is_empty() {
+            return Err(BrowserError::PinRecordsRequired(pinned));
+        }
+        let page = fetch_page(endpoint, site, path)?;
+        verify_pinned(&page, &pinned, path, &records, now_unix())?;
+        Ok(page)
     }
 
     /// Navigate to `<site[/path]>`, pushing a history entry.
@@ -309,13 +327,16 @@ pub fn navigate_with_records(
         if records.is_empty() {
             return Err(BrowserError::PinRecordsRequired(pinned.clone()));
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        verify_pinned(&page, pinned, path, records, now)?;
+        verify_pinned(&page, pinned, path, records, now_unix())?;
     }
     Ok(page)
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Fail-closed pin check: at least one record must vouch that the canonical
@@ -538,6 +559,26 @@ mod tests {
             navigate_verified(&r, "example", "home"),
             Err(BrowserError::PinRecordsRequired(_))
         ));
+    }
+
+    #[test]
+    fn session_pin_verifies_history_nav() {
+        let id = nexus_identity::SiteIdentity::from_secret_bytes(&[25u8; 32]).unwrap();
+        let addr = serve_signed_twice(test_page("example", "home"), &id);
+        // NOTE: the test server answers twice; open consumes both (RECORDS
+        // + FETCH), so back/forward here only exercise history plumbing.
+        let mut session = ClientSession::new(addr.to_string()).with_pin(Some(id.site_id()));
+        session.open("example/home").unwrap();
+        assert_eq!(session.history.current().unwrap().page.metadata.title, "T");
+        // Wrong pin from the start: open fails closed, history stays empty.
+        let other = nexus_identity::SiteIdentity::from_secret_bytes(&[26u8; 32]).unwrap();
+        let addr2 = serve_signed_twice(test_page("example", "home"), &id);
+        let mut bad = ClientSession::new(addr2.to_string()).with_pin(Some(other.site_id()));
+        assert!(matches!(
+            bad.open("example/home"),
+            Err(BrowserError::PinMismatch { .. })
+        ));
+        assert!(bad.history.current().is_none());
     }
 
     #[test]

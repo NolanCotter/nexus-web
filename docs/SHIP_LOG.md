@@ -36,6 +36,7 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #32 resolver M3: seq, revocation tombstones, pin enforcement, rotation (ADR 009)
 - [x] #33 security batteries: 237-input parser totality, traversal, 64-byte sig flips, resolver/store behavior (168 green)
 - [x] #34 RECORDS verb + server record signing (--key) + wire-verified browser fetch (--pin); M3 gap 1 closed
+- [x] #35 verified sessions: ClientSession pinning + `nexus browse --pin` interactive verified nav
 - Next: TUI browser, record refresh without restart, DHT past gates.
 
 ## Notes (wave 2, 2026-09-17)

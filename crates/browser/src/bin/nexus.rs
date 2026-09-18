@@ -11,7 +11,7 @@ use std::io::{self, BufRead, Write};
 const DEFAULT_SERVER: &str = "127.0.0.1:7843";
 
 fn usage() -> &'static str {
-    "usage: nexus browse <site[/path]> [--server HOST:PORT]\n\
+    "usage: nexus browse <site[/path]> [--server HOST:PORT] [--pin SITE_ID]\n\
      \n\
      commands at the prompt:\n\
        b | back       go back in history\n\
@@ -55,9 +55,10 @@ fn parse_command(line: &str) -> Command {
 }
 
 /// Err(code) once the process should exit (help/version printed, or bad args).
-fn parse_args(args: &[String]) -> Result<(String, Option<String>), i32> {
+fn parse_args(args: &[String]) -> Result<(String, Option<String>, Option<String>), i32> {
     let mut server = DEFAULT_SERVER.to_string();
     let mut target = None;
+    let mut pin: Option<String> = None;
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -78,6 +79,15 @@ fn parse_args(args: &[String]) -> Result<(String, Option<String>), i32> {
                     }
                 };
             }
+            "--pin" => {
+                pin = Some(match it.next() {
+                    Some(v) => v.clone(),
+                    None => {
+                        eprintln!("{}", usage());
+                        return Err(2);
+                    }
+                });
+            }
             "browse" => {}
             s if s.starts_with('-') => {
                 eprintln!("unknown arg: {s}\n{}", usage());
@@ -86,7 +96,7 @@ fn parse_args(args: &[String]) -> Result<(String, Option<String>), i32> {
             s => target = Some(s.to_string()),
         }
     }
-    Ok((server, target))
+    Ok((server, target, pin))
 }
 
 fn render(session: &ClientSession) {
@@ -154,7 +164,7 @@ fn interactive(session: &mut ClientSession) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (server, target) = match parse_args(&args) {
+    let (server, target, pin) = match parse_args(&args) {
         Ok(t) => t,
         Err(code) => std::process::exit(code),
     };
@@ -163,7 +173,7 @@ fn main() {
         std::process::exit(2);
     };
 
-    let mut session = ClientSession::new(server);
+    let mut session = ClientSession::new(server).with_pin(pin);
     if let Err(e) = session.open(&target) {
         eprintln!("nexus: {target}: {e}");
         std::process::exit(1);
@@ -215,13 +225,36 @@ mod tests {
                 "127.0.0.1:9".into()
             ])
             .unwrap(),
-            ("127.0.0.1:9".to_string(), Some("example/home".to_string()))
+            (
+                "127.0.0.1:9".to_string(),
+                Some("example/home".to_string()),
+                None
+            )
         );
         assert_eq!(
             parse_args(&["example".into()]).unwrap(),
-            (DEFAULT_SERVER.to_string(), Some("example".to_string()))
+            (
+                DEFAULT_SERVER.to_string(),
+                Some("example".to_string()),
+                None
+            )
+        );
+        assert_eq!(
+            parse_args(&[
+                "browse".into(),
+                "example".into(),
+                "--pin".into(),
+                "abc123".into()
+            ])
+            .unwrap(),
+            (
+                DEFAULT_SERVER.to_string(),
+                Some("example".to_string()),
+                Some("abc123".to_string())
+            )
         );
         assert_eq!(parse_args(&["--nope".into()]), Err(2));
         assert_eq!(parse_args(&["--help".into()]), Err(0));
+        assert_eq!(parse_args(&["browse".into(), "--pin".into()]), Err(2));
     }
 }
