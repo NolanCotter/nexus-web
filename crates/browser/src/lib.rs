@@ -288,10 +288,11 @@ pub fn navigate(resolver: &LocalResolver, site: &str, path: &str) -> Result<Page
 
 /// Resolve, fetch, and verify against an explicit chain of signed records.
 ///
-/// The server does not serve [`SignedRecord`]s yet (gap — 007 doc), so
-/// records are accepted explicitly instead of fetched from the wire. When
-/// `Route.pinned_site_id` is `Some`, at least one record must match the
+/// When `Route.pinned_site_id` is `Some`, at least one record must match the
 /// pinned site, the path, and the fetched page's BLAKE3 content id.
+/// Prefer [`navigate_verified`], which fetches the chain from the server
+/// over `RECORDS`; this variant exists for out-of-band chains (tests,
+/// offline bundles, future transports).
 pub fn navigate_with_records(
     resolver: &LocalResolver,
     site: &str,
@@ -350,6 +351,61 @@ fn verify_pinned(
     }
 }
 
+/// Fetch the signed-record chain for (site, path) from `endpoint` over
+/// `RECORDS`. A 404 (server has no records) yields an empty chain; any
+/// other non-200 status is an error, as is an unparseable body.
+pub fn fetch_records(
+    endpoint: &str,
+    site: &str,
+    path: &str,
+) -> Result<Vec<nexus_identity::SignedRecord>, BrowserError> {
+    let req = nexus_protocol::RecordsRequest {
+        site: site.to_string(),
+        path: path.to_string(),
+    };
+    let line = nexus_protocol::encode_records_request(&req)?;
+    let (code, body) = nexus_transport::fetch_raw(endpoint, &line)?;
+    match code {
+        200 => serde_json::from_slice(&body)
+            .map_err(|e| BrowserError::Content(format!("bad records body: {e}"))),
+        404 => Ok(Vec::new()),
+        other => Err(BrowserError::Status(
+            other,
+            String::from_utf8_lossy(&body).into_owned(),
+        )),
+    }
+}
+
+/// Resolve, then fetch the page *and* its signed records from the first
+/// endpoint and verify the page against `Route.pinned_site_id`.
+///
+/// This closes the M3 gap: records travel over the wire (`RECORDS`) from
+/// the same host that serves the page, and a pinned route fails closed
+/// when the chain is missing or does not vouch for the fetched bytes.
+/// Routes without a pin fetch the page unverified, exactly like
+/// [`navigate`].
+pub fn navigate_verified(
+    resolver: &LocalResolver,
+    site: &str,
+    path: &str,
+) -> Result<Page, BrowserError> {
+    let route = resolver.resolve(site)?;
+    let endpoint = route
+        .endpoints
+        .first()
+        .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
+    if route.pinned_site_id.is_none() {
+        return fetch_page(endpoint, site, path);
+    }
+    let records = fetch_records(endpoint, site, path)?;
+    if records.is_empty() {
+        // Fail before touching page bytes: no chain, no fetch.
+        return Err(BrowserError::PinRecordsRequired(
+            route.pinned_site_id.clone().unwrap_or_default(),
+        ));
+    }
+    navigate_with_records(resolver, site, path, &records)
+}
 /// Resolve `site`, then fetch `path` through `cache` (offline fallback).
 /// Returns the page plus its [`CacheStatus`] banner marker.
 pub fn navigate_cached(
@@ -400,6 +456,40 @@ mod tests {
         addr
     }
 
+    /// Serve one page plus its signed records; accepts two connections
+    /// (RECORDS then FETCH, in the order `navigate_verified` issues them).
+    fn serve_signed_twice(
+        page_bytes: Vec<u8>,
+        identity: &nexus_identity::SiteIdentity,
+    ) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let identity = identity.clone();
+        std::thread::spawn(move || {
+            let mut store = nexus_server::SiteStore::new();
+            store.insert("example", "home", page_bytes);
+            store.sign_pages(&identity, 9_999_999_999).unwrap();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                nexus_server::handle_one(&stream, &store).unwrap();
+            }
+        });
+        addr
+    }
+
+    fn pinned_route(addr: std::net::SocketAddr, site_id: String) -> LocalResolver {
+        let mut r = LocalResolver::new();
+        r.insert(
+            "example",
+            nexus_resolver::Route {
+                endpoints: vec![addr.to_string()],
+                pinned_site_id: Some(site_id),
+            },
+        )
+        .unwrap();
+        r
+    }
+
     #[test]
     fn navigate_via_resolver() {
         let addr = serve_once(test_page("example", "home"));
@@ -414,6 +504,40 @@ mod tests {
         .unwrap();
         let page = navigate(&r, "example", "home").unwrap();
         assert_eq!(page.metadata.title, "T");
+    }
+
+    #[test]
+    fn verified_fetch_succeeds_over_wire() {
+        let id = nexus_identity::SiteIdentity::from_secret_bytes(&[21u8; 32]).unwrap();
+        let addr = serve_signed_twice(test_page("example", "home"), &id);
+        let r = pinned_route(addr, id.site_id());
+        let page = navigate_verified(&r, "example", "home").unwrap();
+        assert_eq!(page.metadata.title, "T");
+    }
+
+    #[test]
+    fn verified_fetch_rejects_wrong_key() {
+        let id = nexus_identity::SiteIdentity::from_secret_bytes(&[22u8; 32]).unwrap();
+        let other = nexus_identity::SiteIdentity::from_secret_bytes(&[23u8; 32]).unwrap();
+        let addr = serve_signed_twice(test_page("example", "home"), &id);
+        // Pinned to a key that never signed the page: fail closed.
+        let r = pinned_route(addr, other.site_id());
+        assert!(matches!(
+            navigate_verified(&r, "example", "home"),
+            Err(BrowserError::PinMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verified_fetch_fails_closed_without_records() {
+        // Recordless server + pinned route: RECORDS 404s, page refused.
+        let addr = serve_once(test_page("example", "home"));
+        let id = nexus_identity::SiteIdentity::from_secret_bytes(&[24u8; 32]).unwrap();
+        let r = pinned_route(addr, id.site_id());
+        assert!(matches!(
+            navigate_verified(&r, "example", "home"),
+            Err(BrowserError::PinRecordsRequired(_))
+        ));
     }
 
     #[test]
