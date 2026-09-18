@@ -1,7 +1,8 @@
 //! NXP/0.1 — minimal prototype wire protocol.
 //!
-//! Text request line over TCP (prototype, not final):
-//!   `NXP/0.1 FETCH <site> <path>\n`
+//! Text request lines over TCP (prototype, not final):
+//!   `NXP/0.1 FETCH <site> <path>\n` — fetch a page body
+//!   `NXP/0.1 RECORDS <site> <path>\n` — fetch signed records for a page
 //! Response:
 //!   `NXP/0.1 <CODE> <LEN>\n<body bytes>`
 //!
@@ -29,6 +30,17 @@ pub struct FetchRequest {
     pub path: String,
 }
 
+/// A parsed `RECORDS` request: which site's signed records, which path.
+/// Same shape and validation as [`FetchRequest`]; only the verb differs,
+/// so a server without records answers `404` instead of failing to parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordsRequest {
+    /// Lowercase site name (see [`is_valid_site`]).
+    pub site: String,
+    /// Content path, no leading slash (see [`is_valid_path`]).
+    pub path: String,
+}
+
 /// A parsed response header: status code plus the exact body length.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseHeader {
@@ -49,7 +61,7 @@ pub enum ProtocolError {
     BodyTooLarge(usize),
     /// Version prefix is not [`VERSION`].
     BadVersion(String),
-    /// Verb is not `FETCH`.
+    /// Verb is neither `FETCH` nor `RECORDS`.
     BadVerb(String),
     /// Site name fails [`is_valid_site`].
     BadSite(String),
@@ -115,18 +127,45 @@ pub fn is_valid_path(s: &str) -> bool {
 /// Encode a request to its wire line. Fails on invalid site/path so bad
 /// input is caught locally instead of sent to the server.
 pub fn encode_request(req: &FetchRequest) -> Result<String, ProtocolError> {
-    if !is_valid_site(&req.site) {
-        return Err(ProtocolError::BadSite(req.site.clone()));
+    encode_request_line("FETCH", &req.site, &req.path)
+}
+
+/// Encode a `RECORDS` request to its wire line. Same validation as FETCH.
+pub fn encode_records_request(req: &RecordsRequest) -> Result<String, ProtocolError> {
+    encode_request_line("RECORDS", &req.site, &req.path)
+}
+
+fn encode_request_line(verb: &str, site: &str, path: &str) -> Result<String, ProtocolError> {
+    if !is_valid_site(site) {
+        return Err(ProtocolError::BadSite(site.to_string()));
     }
-    if !is_valid_path(&req.path) {
-        return Err(ProtocolError::BadPath(req.path.clone()));
+    if !is_valid_path(path) {
+        return Err(ProtocolError::BadPath(path.to_string()));
     }
-    Ok(format!("{VERSION} FETCH {} {}\n", req.site, req.path))
+    Ok(format!("{VERSION} {verb} {site} {path}\n"))
 }
 
 /// Parse one request line (untrusted input). Rejects wrong version/verb,
 /// invalid site/path, and trailing extra tokens with typed errors.
 pub fn parse_request(line: &str) -> Result<FetchRequest, ProtocolError> {
+    let (verb, site, path) = split_request_line(line)?;
+    if verb != "FETCH" {
+        return Err(ProtocolError::BadVerb(verb));
+    }
+    Ok(FetchRequest { site, path })
+}
+
+/// Parse one `RECORDS` request line (untrusted input). Same rules as
+/// [`parse_request`]; only the verb differs.
+pub fn parse_records_request(line: &str) -> Result<RecordsRequest, ProtocolError> {
+    let (verb, site, path) = split_request_line(line)?;
+    if verb != "RECORDS" {
+        return Err(ProtocolError::BadVerb(verb));
+    }
+    Ok(RecordsRequest { site, path })
+}
+
+fn split_request_line(line: &str) -> Result<(String, String, String), ProtocolError> {
     let line = line.strip_suffix('\n').unwrap_or(line);
     let line = line.strip_suffix('\r').unwrap_or(line);
     if line.is_empty() {
@@ -143,9 +182,6 @@ pub fn parse_request(line: &str) -> Result<FetchRequest, ProtocolError> {
     if version != VERSION {
         return Err(ProtocolError::BadVersion(version.to_string()));
     }
-    if verb != "FETCH" {
-        return Err(ProtocolError::BadVerb(verb.to_string()));
-    }
     if !is_valid_site(site) {
         return Err(ProtocolError::BadSite(site.to_string()));
     }
@@ -157,10 +193,7 @@ pub fn parse_request(line: &str) -> Result<FetchRequest, ProtocolError> {
     if site.is_empty() || path.is_empty() || path.contains(' ') {
         return Err(ProtocolError::Malformed(line.to_string()));
     }
-    Ok(FetchRequest {
-        site: site.to_string(),
-        path: path.to_string(),
-    })
+    Ok((verb.to_string(), site.to_string(), path.to_string()))
 }
 
 /// Encode a full response frame (header line + body). Rejects oversize
@@ -248,6 +281,47 @@ mod tests {
         let line = encode_request(&req).unwrap();
         assert_eq!(line, "NXP/0.1 FETCH example home\n");
         assert_eq!(parse_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn roundtrip_records_request() {
+        let req = RecordsRequest {
+            site: "example".into(),
+            path: "home".into(),
+        };
+        let line = encode_records_request(&req).unwrap();
+        assert_eq!(line, "NXP/0.1 RECORDS example home\n");
+        assert_eq!(parse_records_request(&line).unwrap(), req);
+    }
+
+    #[test]
+    fn verbs_do_not_cross_parse() {
+        // FETCH lines are not valid RECORDS and vice versa.
+        assert!(matches!(
+            parse_records_request("NXP/0.1 FETCH example home\n"),
+            Err(ProtocolError::BadVerb(_))
+        ));
+        assert!(matches!(
+            parse_request("NXP/0.1 RECORDS example home\n"),
+            Err(ProtocolError::BadVerb(_))
+        ));
+    }
+
+    #[test]
+    fn records_rejects_bad_site_and_path() {
+        assert!(matches!(
+            parse_records_request("NXP/0.1 RECORDS Example home\n"),
+            Err(ProtocolError::BadSite(_))
+        ));
+        assert!(matches!(
+            parse_records_request("NXP/0.1 RECORDS example ../x\n"),
+            Err(ProtocolError::BadPath(_))
+        ));
+        let bad = RecordsRequest {
+            site: "example".into(),
+            path: "a b".into(),
+        };
+        assert!(encode_records_request(&bad).is_err());
     }
 
     #[test]
