@@ -38,7 +38,8 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #34 RECORDS verb + server record signing (--key) + wire-verified browser fetch (--pin); M3 gap 1 closed
 - [x] #35 verified sessions: ClientSession pinning + `nexus browse --pin` interactive verified nav
 - [x] #36 background record refresh: re-signer thread + --resign-interval, no restart
-- Next: TUI browser, DHT past gates.
+- [x] #37 full-screen TUI browser (`nexus-tui`): testable state machine + ratatui shell, verified-fetch aware
+- Next: DHT past gates, record refresh already done, WebVM execution.
 
 ## Notes (wave 2, 2026-09-17)
 - `cargo test --workspace`: 141+ passed, 0 failed. `cargo fmt --check`: clean.

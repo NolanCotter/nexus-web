@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "nexus"
 path = "src/bin/nexus.rs"
 
+[[bin]]
+name = "nexus-tui"
+path = "src/bin/nexus-tui.rs"
+
 [lib]
 name = "nexus_browser"
 path = "src/lib.rs"
