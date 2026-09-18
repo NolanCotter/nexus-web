@@ -507,6 +507,7 @@ dependencies = [
  "hex",
  "nexus-identity",
  "nexus-protocol",
+ "nexus-transport",
  "serde",
  "serde_json",
  "thiserror",
