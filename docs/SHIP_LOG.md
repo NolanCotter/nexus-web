@@ -41,6 +41,7 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #37 full-screen TUI browser (`nexus-tui`): testable state machine + ratatui shell, verified-fetch aware
 - [x] #38 verified offline cache: pinned chains cached + re-verified stale serve (`--pin` works offline)
 - [x] #39 LIST verb + `nexus sync` site mirroring (verified with --pin)
+- [x] #40 demo covers signed flow: keyed server, pin accept/refuse, verified sync
 - Next: DHT past gates, WebVM execution.
 
 ## Notes (wave 2, 2026-09-17)
