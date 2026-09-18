@@ -208,12 +208,12 @@ impl FsStore {
     }
 
     fn path_for(&self, id: &str) -> Result<PathBuf, StoreError> {
-        let hex_part = id
-            .strip_prefix("b3:")
-            .ok_or_else(|| StoreError::Corrupt(format!("bad content id {id}")))?;
-        if hex_part.len() != 64 || !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Canonical form only (lowercase hex): rejects uppercase aliases
+        // that would otherwise fragment the store across two spellings.
+        if !nexus_protocol::is_content_id(id) {
             return Err(StoreError::Corrupt(format!("bad content id {id}")));
         }
+        let hex_part = &id[3..];
         // Reject path traversal defensively (hex check already covers it).
         if id.contains('/') || id.contains('.') {
             return Err(StoreError::Corrupt("bad content id".into()));

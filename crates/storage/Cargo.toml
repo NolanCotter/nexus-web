@@ -10,6 +10,7 @@ name = "nexus_storage"
 path = "src/lib.rs"
 
 [dependencies]
+nexus-protocol = { path = "../protocol" }
 blake3 = "1"
 hex = "0.4"
 thiserror = "1"

@@ -248,10 +248,10 @@ pub fn content_id_of(bytes: &[u8]) -> String {
 }
 
 /// True for well-formed content IDs: `b3:` plus 64 lowercase/uppercase hex chars.
-pub fn is_content_id(s: &str) -> bool {
-    let hex_part = s.strip_prefix("b3:").unwrap_or("__invalid__");
-    hex_part.len() == 64 && hex_part.chars().all(|c| c.is_ascii_hexdigit())
-}
+/// Canonical content-id check, re-exported from the protocol crate so
+/// every layer agrees: `b3:` plus 64 *lowercase* hex chars. Uppercase hex
+/// is rejected (fail-closed; canonical store paths are lowercase).
+pub use nexus_protocol::is_content_id;
 
 /// An outbound edge of a resource: a labelled [`LinkTarget`].
 ///
@@ -551,6 +551,21 @@ mod tests {
         }
         let mut p = example_page();
         p.components = vec![inner];
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn content_ids_are_canonical_lowercase() {
+        // Uppercase hex is a different spelling of the same digest: reject
+        // it everywhere so layers never disagree (protocol/storage rule).
+        assert!(is_content_id(&format!("b3:{}", "ab".repeat(32))));
+        assert!(!is_content_id(&format!("b3:{}", "AB".repeat(32))));
+        assert!(!is_content_id("b3:xyz"));
+        let mut p = example_page();
+        p.components.push(Component::Image {
+            content_id: format!("b3:{}", "AB".repeat(32)),
+            alt: "x".into(),
+        });
         assert!(p.validate().is_err());
     }
 
