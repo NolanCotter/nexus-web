@@ -245,21 +245,20 @@ impl ClientSession {
 
     fn fetch(&mut self, site: &str, path: &str) -> Result<Page, BrowserError> {
         let route = self.route(site)?;
-        let endpoint = route
-            .endpoints
-            .first()
-            .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
-        let (page, status) = match (&self.cache, route.pinned_site_id.clone()) {
-            // Pinned + cached: verified fetch with verified-stale fallback.
-            // A verified refusal (no chain) is returned as-is even when the
-            // plain cache holds the page: unpinned bytes never satisfy a pin.
-            (Some(cache), Some(pinned)) => cache.fetch_verified(endpoint, site, path, &pinned),
-            (Some(cache), None) => cache.fetch(endpoint, site, path),
-            (None, Some(_)) => {
-                navigate_verified(&self.resolver, site, path).map(|page| (page, CacheStatus::Fresh))
-            }
-            (None, None) => fetch_page(endpoint, site, path).map(|page| (page, CacheStatus::Fresh)),
-        }?;
+        let (page, status) =
+            match (&self.cache, route.pinned_site_id.clone()) {
+                // Pinned + cached: verified fetch with verified-stale fallback.
+                // A verified refusal (no chain) is returned as-is even when the
+                // plain cache holds the page: unpinned bytes never satisfy a pin.
+                (Some(cache), Some(pinned)) => {
+                    cache.fetch_verified(&route.endpoints, site, path, &pinned)
+                }
+                (Some(cache), None) => cache.fetch(&route.endpoints, site, path),
+                (None, Some(_)) => navigate_verified(&self.resolver, site, path)
+                    .map(|page| (page, CacheStatus::Fresh)),
+                (None, None) => fetch_page_any(&route.endpoints, site, path)
+                    .map(|page| (page, CacheStatus::Fresh)),
+            }?;
         self.last_status = Some(status);
         Ok(page)
     }
@@ -306,6 +305,44 @@ impl ClientSession {
     }
 }
 
+/// Try each endpoint in order, moving on only on transport-level I/O
+/// failure (refused/timeout). An endpoint that answers — even with an
+/// error status — is authoritative for the attempt: statuses never fail
+/// over (a 404 from replica one must not become replica two's page).
+/// All-dead returns the last I/O error; no endpoints is a local error.
+pub(crate) fn failover<T>(
+    endpoints: &[String],
+    mut attempt: impl FnMut(&str) -> Result<T, BrowserError>,
+) -> Result<T, BrowserError> {
+    if endpoints.is_empty() {
+        return Err(BrowserError::Content("route has no endpoints".into()));
+    }
+    let mut last = None;
+    for endpoint in endpoints {
+        match attempt(endpoint) {
+            Err(e @ BrowserError::Transport(nexus_transport::TransportError::Io(_))) => {
+                last = Some(e);
+            }
+            other => return other,
+        }
+    }
+    Err(last.unwrap_or_else(|| BrowserError::Content("route has no endpoints".into())))
+}
+
+/// Fetch and parse one page from the first live endpoint.
+pub fn fetch_page_any(endpoints: &[String], site: &str, path: &str) -> Result<Page, BrowserError> {
+    failover(endpoints, |endpoint| fetch_page(endpoint, site, path))
+}
+
+/// Fetch the record chain from the first live endpoint.
+pub fn fetch_records_any(
+    endpoints: &[String],
+    site: &str,
+    path: &str,
+) -> Result<Vec<nexus_identity::SignedRecord>, BrowserError> {
+    failover(endpoints, |endpoint| fetch_records(endpoint, site, path))
+}
+
 /// Fetch and parse one page. `endpoint` is `host:port`.
 pub fn fetch_page(endpoint: &str, site: &str, path: &str) -> Result<Page, BrowserError> {
     let req = nexus_protocol::FetchRequest {
@@ -346,11 +383,7 @@ pub fn navigate_with_records(
     records: &[nexus_identity::SignedRecord],
 ) -> Result<Page, BrowserError> {
     let route = resolver.resolve(site)?;
-    let endpoint = route
-        .endpoints
-        .first()
-        .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
-    let page = fetch_page(endpoint, site, path)?;
+    let page = fetch_page_any(&route.endpoints, site, path)?;
     if let Some(pinned) = &route.pinned_site_id {
         if records.is_empty() {
             return Err(BrowserError::PinRecordsRequired(pinned.clone()));
@@ -439,14 +472,10 @@ pub fn navigate_verified(
     path: &str,
 ) -> Result<Page, BrowserError> {
     let route = resolver.resolve(site)?;
-    let endpoint = route
-        .endpoints
-        .first()
-        .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
     if route.pinned_site_id.is_none() {
-        return fetch_page(endpoint, site, path);
+        return fetch_page_any(&route.endpoints, site, path);
     }
-    let records = fetch_records(endpoint, site, path)?;
+    let records = fetch_records_any(&route.endpoints, site, path)?;
     if records.is_empty() {
         // Fail before touching page bytes: no chain, no fetch.
         return Err(BrowserError::PinRecordsRequired(
@@ -464,11 +493,7 @@ pub fn navigate_cached(
     path: &str,
 ) -> Result<(Page, CacheStatus), BrowserError> {
     let route = resolver.resolve(site)?;
-    let endpoint = route
-        .endpoints
-        .first()
-        .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
-    cache.fetch(endpoint, site, path)
+    cache.fetch(&route.endpoints, site, path)
 }
 
 /// Resolve `site`, then fetch `path` verified against the route pin with
@@ -482,13 +507,9 @@ pub fn navigate_cached_verified(
     path: &str,
 ) -> Result<(Page, CacheStatus), BrowserError> {
     let route = resolver.resolve(site)?;
-    let endpoint = route
-        .endpoints
-        .first()
-        .ok_or_else(|| BrowserError::Content("route has no endpoints".into()))?;
     match route.pinned_site_id.clone() {
-        None => cache.fetch(endpoint, site, path),
-        Some(pin) => cache.fetch_verified(endpoint, site, path, &pin),
+        None => cache.fetch(&route.endpoints, site, path),
+        Some(pin) => cache.fetch_verified(&route.endpoints, site, path, &pin),
     }
 }
 
@@ -826,6 +847,50 @@ mod tests {
         session.open("example/home").unwrap();
         assert_eq!(session.last_status(), Some(CacheStatus::StaleVerified));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failover_tries_endpoints_in_order() {
+        let addr = serve_once(test_page("example", "home"));
+        // Closed port first: listener bound then dropped.
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap().to_string();
+            drop(l);
+            a
+        };
+        let live = addr.to_string();
+        let page = fetch_page_any(&[dead, live], "example", "home").unwrap();
+        assert_eq!(page.metadata.title, "T");
+    }
+
+    #[test]
+    fn failover_all_dead_returns_io() {
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap().to_string();
+            drop(l);
+            a
+        };
+        let err = fetch_page_any(&[dead.clone(), dead], "example", "home").unwrap_err();
+        assert!(matches!(
+            err,
+            BrowserError::Transport(nexus_transport::TransportError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn failover_never_masks_status_errors() {
+        // Live server, missing page: the 404 is authoritative, no failover.
+        let addr = serve_once(test_page("example", "home"));
+        let err = fetch_page_any(&[addr.to_string()], "example", "nope").unwrap_err();
+        assert!(matches!(err, BrowserError::Status(404, _)));
+    }
+
+    #[test]
+    fn failover_empty_route_is_local_error() {
+        let err = fetch_page_any(&[], "example", "home").unwrap_err();
+        assert!(matches!(err, BrowserError::Content(_)));
     }
 
     #[test]

@@ -153,7 +153,7 @@ impl OfflineCache {
     /// response) are never shadowed.
     pub fn fetch(
         &self,
-        endpoint: &str,
+        endpoints: &[String],
         site: &str,
         path: &str,
     ) -> Result<(Page, CacheStatus), BrowserError> {
@@ -164,7 +164,9 @@ impl OfflineCache {
         };
         // Validate before sending so errors are local, not network roundtrips.
         nexus_protocol::encode_request(&req)?;
-        match nexus_transport::fetch(endpoint, &req) {
+        match crate::failover(endpoints, |endpoint| {
+            nexus_transport::fetch(endpoint, &req).map_err(BrowserError::from)
+        }) {
             Ok((200, body)) => {
                 let page = nexus_content::Page::from_json(&body)
                     .map_err(|e| BrowserError::Content(e.to_string()))?;
@@ -175,19 +177,20 @@ impl OfflineCache {
                 // Confirmed current by the server; corrupt local copy falls
                 // back to one unconditional fetch rather than failing.
                 Some(page) => Ok((page, CacheStatus::Fresh)),
-                None => Ok((crate::fetch_page(endpoint, site, path)?, CacheStatus::Fresh)),
+                None => Ok((
+                    crate::fetch_page_any(endpoints, site, path)?,
+                    CacheStatus::Fresh,
+                )),
             },
             Ok((code, body)) => Err(BrowserError::Status(
                 code,
                 String::from_utf8_lossy(&body).into_owned(),
             )),
-            Err(nexus_transport::TransportError::Io(inner)) => self
+            Err(e @ BrowserError::Transport(nexus_transport::TransportError::Io(_))) => self
                 .lookup(site, path)
                 .map(|p| (p, CacheStatus::Stale))
-                .ok_or(BrowserError::Transport(
-                    nexus_transport::TransportError::Io(inner),
-                )),
-            Err(e) => Err(e.into()),
+                .ok_or(e),
+            Err(e) => Err(e),
         }
     }
 
@@ -314,14 +317,14 @@ impl OfflineCache {
     /// Non-transport errors (404, bad records, pin mismatch) are never shadowed.
     pub fn fetch_verified(
         &self,
-        endpoint: &str,
+        endpoints: &[String],
         site: &str,
         path: &str,
         pin: &str,
     ) -> Result<(Page, CacheStatus), BrowserError> {
         let fresh = (|| {
-            let page = crate::fetch_page(endpoint, site, path)?;
-            let records = crate::fetch_records(endpoint, site, path)?;
+            let page = crate::fetch_page_any(endpoints, site, path)?;
+            let records = crate::fetch_records_any(endpoints, site, path)?;
             if records.is_empty() {
                 return Err(BrowserError::PinRecordsRequired(pin.to_string()));
             }

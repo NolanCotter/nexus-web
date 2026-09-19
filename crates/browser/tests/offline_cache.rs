@@ -77,7 +77,7 @@ fn pinned_offline_serves_verified_stale() {
     let (addr, server) = serve_signed_twice(page_bytes(1), &id);
 
     let (page, status) = cache
-        .fetch_verified(&addr.to_string(), "example", "home", &id.site_id())
+        .fetch_verified(&[addr.to_string()], "example", "home", &id.site_id())
         .unwrap();
     assert!(matches!(status, CacheStatus::Fresh));
     assert_eq!(page.metadata.revision, 1);
@@ -85,7 +85,7 @@ fn pinned_offline_serves_verified_stale() {
     server.join().unwrap(); // server dead: port closed
 
     let (page2, status2) = cache
-        .fetch_verified(&addr.to_string(), "example", "home", &id.site_id())
+        .fetch_verified(&[addr.to_string()], "example", "home", &id.site_id())
         .unwrap();
     assert!(matches!(status2, CacheStatus::StaleVerified));
     assert_eq!(page2.to_canonical_json().unwrap(), page_bytes(1));
@@ -100,13 +100,13 @@ fn verified_stale_rejects_wrong_pin_and_tamper() {
     let other = test_key(33);
     let (addr, server) = serve_signed_twice(page_bytes(1), &id);
     cache
-        .fetch_verified(&addr.to_string(), "example", "home", &id.site_id())
+        .fetch_verified(&[addr.to_string()], "example", "home", &id.site_id())
         .unwrap();
     server.join().unwrap();
 
     // Wrong pin: no entry applies, transport error propagates.
     let err = cache
-        .fetch_verified(&addr.to_string(), "example", "home", &other.site_id())
+        .fetch_verified(&[addr.to_string()], "example", "home", &other.site_id())
         .unwrap_err();
     assert!(matches!(err, BrowserError::Transport(_)));
 
@@ -126,7 +126,7 @@ fn verified_stale_rejects_wrong_pin_and_tamper() {
     // NOTE: flipping may break JSON parsing or the signature; either way
     // the entry must not serve. (BLAKE3 catches it first → miss + evict.)
     let err = cache
-        .fetch_verified(&addr.to_string(), "example", "home", &id.site_id())
+        .fetch_verified(&[addr.to_string()], "example", "home", &id.site_id())
         .unwrap_err();
     assert!(matches!(err, BrowserError::Transport(_)));
     let idx: serde_json::Value =
@@ -141,13 +141,13 @@ fn offline_fetch_returns_stale_after_server_dies() {
     let cache = OfflineCache::new(&dir);
     let (addr, server) = serve_once(page_bytes(1));
 
-    let (page, status) = cache.fetch(&addr.to_string(), "example", "home").unwrap();
+    let (page, status) = cache.fetch(&[addr.to_string()], "example", "home").unwrap();
     assert!(matches!(status, CacheStatus::Fresh));
     assert_eq!(page.metadata.revision, 1);
 
     server.join().unwrap(); // server dead: port closed
 
-    let (page2, status2) = cache.fetch(&addr.to_string(), "example", "home").unwrap();
+    let (page2, status2) = cache.fetch(&[addr.to_string()], "example", "home").unwrap();
     assert!(matches!(status2, CacheStatus::Stale));
     assert_eq!(page2.metadata.revision, 1);
     assert_eq!(page2.to_canonical_json().unwrap(), page_bytes(1)); // identical content
@@ -155,7 +155,7 @@ fn offline_fetch_returns_stale_after_server_dies() {
     // Cold cache + dead server: transport error must propagate (no phantom page).
     let cache2 = OfflineCache::new(temp_dir("stale-cold"));
     let err = cache2
-        .fetch(&addr.to_string(), "example", "home")
+        .fetch(&[addr.to_string()], "example", "home")
         .unwrap_err();
     assert!(matches!(err, BrowserError::Transport(_)));
     let _ = std::fs::remove_dir_all(&dir);
@@ -166,7 +166,7 @@ fn corrupt_blob_is_miss_and_evicted() {
     let dir = temp_dir("corrupt");
     let cache = OfflineCache::new(&dir);
     let (addr, server) = serve_once(page_bytes(1));
-    cache.fetch(&addr.to_string(), "example", "home").unwrap();
+    cache.fetch(&[addr.to_string()], "example", "home").unwrap();
     server.join().unwrap();
 
     // Flip a byte inside the stored blob (length-preserving): BLAKE3 must
@@ -182,7 +182,7 @@ fn corrupt_blob_is_miss_and_evicted() {
     std::fs::write(&blob, bad).unwrap();
 
     let err = cache
-        .fetch(&addr.to_string(), "example", "home")
+        .fetch(&[addr.to_string()], "example", "home")
         .unwrap_err();
     assert!(matches!(err, BrowserError::Transport(_)));
 
@@ -198,18 +198,22 @@ fn fresh_server_revision_replaces_cached_copy() {
     let dir = temp_dir("rev");
     let cache = OfflineCache::new(&dir);
     let (addr, server) = serve_once(page_bytes(1));
-    cache.fetch(&addr.to_string(), "example", "home").unwrap();
+    cache.fetch(&[addr.to_string()], "example", "home").unwrap();
     server.join().unwrap();
 
     // Server returns with revision 2 on a new port (cache keys by site+path).
     let (addr2, server2) = serve_once(page_bytes(2));
-    let (page, status) = cache.fetch(&addr2.to_string(), "example", "home").unwrap();
+    let (page, status) = cache
+        .fetch(&[addr2.to_string()], "example", "home")
+        .unwrap();
     assert!(matches!(status, CacheStatus::Fresh));
     assert_eq!(page.metadata.revision, 2);
     server2.join().unwrap();
 
     // Offline now serves the new revision, not the superseded one.
-    let (page2, status2) = cache.fetch(&addr2.to_string(), "example", "home").unwrap();
+    let (page2, status2) = cache
+        .fetch(&[addr2.to_string()], "example", "home")
+        .unwrap();
     assert!(matches!(status2, CacheStatus::Stale));
     assert_eq!(page2.metadata.revision, 2);
     let _ = std::fs::remove_dir_all(&dir);
@@ -224,7 +228,7 @@ fn second_fetch_sends_precondition_and_takes_304() {
 
     // Prime the cache with a real fetch.
     let (addr, server) = serve_once(page_bytes(1));
-    let (page, _) = cache.fetch(&addr.to_string(), "example", "home").unwrap();
+    let (page, _) = cache.fetch(&[addr.to_string()], "example", "home").unwrap();
     let want = page.content_id().unwrap();
     server.join().unwrap();
 
@@ -242,7 +246,9 @@ fn second_fetch_sends_precondition_and_takes_304() {
         let frame = nexus_protocol::encode_response(304, b"").unwrap();
         stream.try_clone().unwrap().write_all(&frame).unwrap();
     });
-    let (page2, status) = cache.fetch(&addr2.to_string(), "example", "home").unwrap();
+    let (page2, status) = cache
+        .fetch(&[addr2.to_string()], "example", "home")
+        .unwrap();
     assert!(matches!(status, CacheStatus::Fresh));
     assert_eq!(page2.content_id().unwrap(), want);
     handle.join().unwrap();
