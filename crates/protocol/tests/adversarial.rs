@@ -5,7 +5,10 @@
 //! `Err`, they must never panic, overflow, or allocate unboundedly.
 //! Run with plain `cargo test --workspace` (no nightly required).
 
-use nexus_protocol::{parse_request, parse_response_header, split_response, MAX_BODY, MAX_LINE};
+use nexus_protocol::{
+    encode_list_request, encode_records_request, parse_list_request, parse_records_request,
+    parse_request, parse_response_header, split_response, MAX_BODY, MAX_LINE,
+};
 
 // ---- parse_request corpus ------------------------------------------------
 
@@ -156,4 +159,60 @@ fn adversarial_split_response_limits() {
     // Exact-limit claim with missing body is Truncated, not a panic.
     let hdr = format!("NXP/0.1 200 {}\n", MAX_BODY);
     assert!(split_response(hdr.as_bytes()).is_err());
+}
+
+#[test]
+fn adversarial_new_verbs_never_panic() {
+    let id = format!("b3:{}", "ab".repeat(32));
+    // (line, parser to exercise)
+    let corpus: Vec<Vec<u8>> = vec![
+        format!("NXP/0.1 FETCH example home {id}\n").into_bytes(), // if_id accepted
+        format!("NXP/0.1 FETCH example home {id} \n").into_bytes(), // trailing space
+        format!("NXP/0.1 FETCH example home {id} EXTRA\n").into_bytes(), // 5th token
+        b"NXP/0.1 FETCH example home b3:ab\n".to_vec(),            // short id
+        b"NXP/0.1 FETCH example home B3:AB\n".to_vec(),            // non-hex id
+        b"NXP/0.1 FETCH example home +200\n".to_vec(),             // plus-prefix junk
+        format!("NXP/0.1 FETCH example home {}\n", "ab".repeat(64)).into_bytes(), // id, no prefix
+        b"NXP/0.1 RECORDS example home\n".to_vec(),
+        b"NXP/0.1 RECORDS alice @alice\n".to_vec(),
+        b"NXP/0.1 RECORDS alice @\n".to_vec(),
+        b"NXP/0.1 RECORDS alice @other\n".to_vec(),
+        b"NXP/0.1 RECORDS alice @../x\n".to_vec(),
+        b"NXP/0.1 RECORDS Alice @Alice\n".to_vec(),
+        b"NXP/0.1 RECORDS alice @alice extra\n".to_vec(),
+        b"NXP/0.1 FETCH alice @alice\n".to_vec(), // @ never valid for FETCH
+        b"NXP/0.1 LIST example\n".to_vec(),
+        b"NXP/0.1 LIST\n".to_vec(),
+        b"NXP/0.1 LIST example extra\n".to_vec(),
+        b"NXP/0.1 LIST Example\n".to_vec(),
+        b"NXP/0.1 LIST @alice\n".to_vec(),
+    ];
+    assert!(corpus.len() >= 20);
+    for (i, input) in corpus.iter().enumerate() {
+        let s = String::from_utf8_lossy(input);
+        // Every parser: Err-never-panic on every input.
+        let r = parse_request(&s);
+        if let Ok(req) = r {
+            let line = nexus_protocol::encode_request(&req).expect("accepted req must encode");
+            assert_eq!(parse_request(&line).unwrap(), req, "case {i}: not stable");
+        }
+        let r = parse_records_request(&s);
+        if let Ok(req) = r {
+            let line = encode_records_request(&req).expect("accepted RECORDS must encode");
+            assert_eq!(
+                parse_records_request(&line).unwrap(),
+                req,
+                "case {i}: not stable"
+            );
+        }
+        let r = parse_list_request(&s);
+        if let Ok(req) = r {
+            let line = encode_list_request(&req).expect("accepted LIST must encode");
+            assert_eq!(
+                parse_list_request(&line).unwrap(),
+                req,
+                "case {i}: not stable"
+            );
+        }
+    }
 }

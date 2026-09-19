@@ -54,6 +54,7 @@ Legitimate engineering increments only. One line per coherent change.
 - [x] #50 conditional FETCH: content-id preconditions + 304, cache revalidation
 - [x] #51 canonical content IDs unified (lowercase-only everywhere; uppercase aliases rejected)
 - [x] #52 endpoint failover across route endpoints (statuses never mask)
+- [x] #53 adversarial corpus for LIST/RECORDS-@/if_id + fuzz seeds
 - Next: DHT past gates, WebVM execution.
 
 ## Notes (wave 2, 2026-09-17)
