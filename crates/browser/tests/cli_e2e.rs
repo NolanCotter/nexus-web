@@ -211,3 +211,45 @@ fn nexus_export_pack_imports_into_fresh_store() {
     id.verify_record(&records[0], 1_000_000).unwrap();
     let _ = std::fs::remove_file(&pack);
 }
+
+#[test]
+fn nexus_sync_delete_mirrors_exactly() {
+    let addr = spawn_store();
+    let dir = std::env::temp_dir().join(format!("nexus-sync-del-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Stale page, foreign file, and a symlink pointing outside the mirror.
+    std::fs::write(dir.join("stale.json"), b"{}").unwrap();
+    std::fs::write(dir.join("notes.txt"), b"hands off").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/etc/hostname", dir.join("link.json")).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nexus"))
+        .args([
+            "sync",
+            "--server",
+            &addr.to_string(),
+            "--site",
+            "example",
+            "--dir",
+            dir.to_str().unwrap(),
+            "--delete",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1 deleted"), "stdout: {stdout}");
+
+    // Mirror is exact: served pages present, stale gone, foreign kept.
+    assert!(dir.join("home.json").exists());
+    assert!(dir.join("about.json").exists());
+    assert!(!dir.join("stale.json").exists());
+    assert!(dir.join("notes.txt").exists());
+    #[cfg(unix)]
+    assert!(std::fs::symlink_metadata(dir.join("link.json"))
+        .unwrap()
+        .is_symlink());
+    let _ = std::fs::remove_dir_all(&dir);
+}

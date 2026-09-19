@@ -13,7 +13,7 @@ const DEFAULT_SERVER: &str = "127.0.0.1:7843";
 fn usage() -> &'static str {
     "usage:\n\
       nexus browse <site[/path]> [--server HOST:PORT] [--pin SITE_ID]\n\
-      nexus sync --server HOST:PORT --site NAME --dir PATH [--pin SITE_ID]\n\
+      nexus sync --server HOST:PORT --site NAME --dir PATH [--pin SITE_ID] [--delete]\n\
       nexus cache-gc [--dir PATH]\n\
       nexus export --server HOST:PORT --site NAME --out FILE [--pin SITE_ID]\n\
       nexus history\n\
@@ -114,6 +114,7 @@ struct SyncArgs {
     site: String,
     dir: std::path::PathBuf,
     pin: Option<String>,
+    delete: bool,
 }
 
 fn parse_sync_args(args: &[String]) -> Result<SyncArgs, i32> {
@@ -121,10 +122,14 @@ fn parse_sync_args(args: &[String]) -> Result<SyncArgs, i32> {
     let mut site = None;
     let mut dir = None;
     let mut pin = None;
+    let mut delete = false;
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
             "sync" => {}
+            "--delete" => {
+                delete = true;
+            }
             "--server" | "--site" | "--dir" | "--pin" => {
                 let v = match it.next() {
                     Some(v) => v.clone(),
@@ -156,6 +161,7 @@ fn parse_sync_args(args: &[String]) -> Result<SyncArgs, i32> {
             site,
             dir,
             pin,
+            delete,
         }),
         _ => {
             eprintln!("{}", sync_usage());
@@ -172,18 +178,22 @@ fn cmd_sync(args: &[String]) -> i32 {
         Ok(a) => a,
         Err(code) => return code,
     };
-    match nexus_browser::sync_site(
+    match nexus_browser::sync_site_opts(
         &parsed.server,
         &parsed.site,
         parsed.pin.as_deref(),
         &parsed.dir,
+        nexus_browser::SyncOptions {
+            delete: parsed.delete,
+        },
     ) {
         Ok(report) => {
             println!(
-                "synced {} page(s) ({} verified, {} skipped) from {} to {}",
+                "synced {} page(s) ({} verified, {} skipped, {} deleted) from {} to {}",
                 report.pages,
                 report.verified,
                 report.skipped,
+                report.deleted,
                 parsed.site,
                 parsed.dir.display()
             );
@@ -581,6 +591,7 @@ mod tests {
         assert_eq!(a.server, "10.0.0.1:1");
         assert_eq!(a.site, "example");
         assert_eq!(a.pin, None);
+        assert!(!a.delete);
         let a = parse_sync_args(&[
             "sync".into(),
             "--server".into(),
@@ -594,6 +605,18 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(a.pin, Some("abc".to_string()));
+        let a = parse_sync_args(&[
+            "sync".into(),
+            "--server".into(),
+            "10.0.0.1:1".into(),
+            "--site".into(),
+            "example".into(),
+            "--dir".into(),
+            "/tmp/x".into(),
+            "--delete".into(),
+        ])
+        .unwrap();
+        assert!(a.delete);
         assert_eq!(
             parse_sync_args(&["sync".into(), "--site".into(), "e".into()]),
             Err(2)

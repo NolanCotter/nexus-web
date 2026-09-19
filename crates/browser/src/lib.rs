@@ -585,6 +585,18 @@ pub struct SyncReport {
     pub verified: usize,
     /// Listed paths skipped as invalid (never written, never fetched).
     pub skipped: usize,
+    /// Local files deleted by exact mirroring ([`SyncOptions::delete`]).
+    pub deleted: usize,
+}
+
+/// Knobs for [`sync_site_opts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SyncOptions {
+    /// Delete local `*.json` files the server no longer lists, making
+    /// `dir` an exact mirror. Only regular `.json` files are ever
+    /// removed; symlinks, foreign extensions, and directories are left
+    /// alone. Off by default (additive sync).
+    pub delete: bool,
 }
 
 /// Mirror a whole site to `dir`: LIST the paths, FETCH each page (plus
@@ -598,6 +610,20 @@ pub fn sync_site(
     site: &str,
     pin: Option<&str>,
     dir: &std::path::Path,
+) -> Result<SyncReport, BrowserError> {
+    sync_site_opts(endpoint, site, pin, dir, SyncOptions::default())
+}
+
+/// Mirror a whole site to `dir` with [`SyncOptions`]: like [`sync_site`],
+/// plus optional exactness — with `delete`, local `*.json` files the
+/// server no longer lists are removed after a successful sync (failed
+/// syncs delete nothing).
+pub fn sync_site_opts(
+    endpoint: &str,
+    site: &str,
+    pin: Option<&str>,
+    dir: &std::path::Path,
+    opts: SyncOptions,
 ) -> Result<SyncReport, BrowserError> {
     let list_line = nexus_protocol::encode_list_request(&nexus_protocol::ListRequest {
         site: site.to_string(),
@@ -615,23 +641,24 @@ pub fn sync_site(
         pages: 0,
         verified: 0,
         skipped: 0,
+        deleted: 0,
     };
-    for path in paths {
+    for path in &paths {
         // Never let a hostile listing touch the filesystem: only wire-valid
         // relative paths pass, and they cannot contain `..` or absolutes.
-        if !nexus_protocol::is_valid_path(&path) {
+        if !nexus_protocol::is_valid_path(path) {
             report.skipped += 1;
             continue;
         }
         let page = match pin {
-            None => fetch_page(endpoint, site, &path)?,
+            None => fetch_page(endpoint, site, path)?,
             Some(p) => {
-                let records = fetch_records(endpoint, site, &path)?;
+                let records = fetch_records(endpoint, site, path)?;
                 if records.is_empty() {
                     return Err(BrowserError::PinRecordsRequired(p.to_string()));
                 }
-                let page = fetch_page(endpoint, site, &path)?;
-                verify_pinned(&page, p, &path, &records, now_unix())?;
+                let page = fetch_page(endpoint, site, path)?;
+                verify_pinned(&page, p, path, &records, now_unix())?;
                 report.verified += 1;
                 page
             }
@@ -649,7 +676,72 @@ pub fn sync_site(
         std::fs::rename(&tmp, &dest).map_err(|e| BrowserError::Content(format!("publish: {e}")))?;
         report.pages += 1;
     }
+    if opts.delete {
+        // Exact mirror: remove local page files the server no longer
+        // lists. Only reached after a fully successful sync, so a failed
+        // run can never delete. Symlinks and non-JSON files are never
+        // touched; `..` cannot occur (only listed-valid paths are kept).
+        let listed: std::collections::HashSet<String> = paths
+            .iter()
+            .filter(|p| nexus_protocol::is_valid_path(p))
+            .cloned()
+            .collect();
+        report.deleted = delete_unlisted(dir, &listed)?;
+    }
     Ok(report)
+}
+
+/// Delete `*.json` files under `dir` whose path-without-extension is not
+/// in `listed`. Returns the removal count. Never follows symlinks; never
+/// touches non-JSON files or directories themselves.
+fn delete_unlisted(
+    dir: &std::path::Path,
+    listed: &std::collections::HashSet<String>,
+) -> Result<usize, BrowserError> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        listed: &std::collections::HashSet<String>,
+        removed: &mut usize,
+    ) -> Result<(), BrowserError> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(BrowserError::Content(format!("walk: {e}"))),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| BrowserError::Content(format!("walk: {e}")))?;
+            let ftype = entry
+                .file_type()
+                .map_err(|e| BrowserError::Content(format!("walk: {e}")))?;
+            // Never follow symlinks out of the mirror (and never delete them).
+            if ftype.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if ftype.is_dir() {
+                walk(root, &path, listed, removed)?;
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| BrowserError::Content(format!("walk: {e}")))?;
+            let rel = rel.to_string_lossy();
+            let stem = rel.strip_suffix(".json").unwrap_or(&rel).replace('\\', "/");
+            if !listed.contains(&stem) {
+                std::fs::remove_file(&path)
+                    .map_err(|e| BrowserError::Content(format!("delete: {e}")))?;
+                *removed += 1;
+            }
+        }
+        Ok(())
+    }
+    let mut removed = 0;
+    walk(dir, dir, listed, &mut removed)?;
+    Ok(removed)
 }
 
 #[cfg(test)]
