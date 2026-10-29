@@ -377,6 +377,16 @@ fn render(session: &ClientSession) {
             v.path
         );
     }
+    match session.last_status() {
+        // Fresh fetches render silently; cached ones say so.
+        Some(nexus_browser::CacheStatus::Stale) => {
+            println!("[STALE (offline)] served from local cache");
+        }
+        Some(nexus_browser::CacheStatus::StaleVerified) => {
+            println!("[STALE VERIFIED (offline)] served from local cache");
+        }
+        _ => {}
+    }
     print!("{}", session.render_current());
     let _ = io::stdout().flush();
 }
